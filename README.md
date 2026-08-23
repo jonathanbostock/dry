@@ -125,9 +125,11 @@ Suggested project `.gitignore` entry: ignore `.claude/dry/` (archives and snapsh
 ## Install (after review)
 
 ```
-claude plugin marketplace add /workspace/claude-memory-management
+claude plugin marketplace add jonathanbostock/dry
 claude plugin install dry@dry --scope user
 ```
+
+(From a local clone, `claude plugin marketplace add /path/to/dry` works identically.)
 
 Restart any running sessions afterwards — hook configuration is cached per session, so live sessions won't pick the hooks up. To remove: `claude plugin uninstall dry@dry`, then `claude plugin marketplace remove dry` (both verified against v2.1.241). Uninstalling leaves `<project>/.claude/dry/` and `/tmp/claude-dry/` behind; delete them by hand for a clean slate.
 

@@ -3,12 +3,8 @@ description: Report current context usage, top result hogs, ledger and snapshot 
 allowed-tools: Bash(python3:*)
 ---
 
-<!-- ${CLAUDE_PLUGIN_ROOT} is documented as resolving anywhere in skill/command content
-     (research/hooks-api.md §1.3), but its availability inside `!` preprocessing lines
-     specifically is not stated verbatim. If the line below fails to resolve, fall back to
-     invoking the script by absolute path, e.g.:
-       python3 /workspace/claude-memory-management/scripts/dry_status.py
-     (or the installed plugin path shown by `claude plugin details dry`). -->
+<!-- If ${CLAUDE_PLUGIN_ROOT} ever fails to resolve in the `!` line below, invoke
+     dry_status.py by the installed path shown in `claude plugin details dry`. -->
 
 ## dry status report
 
