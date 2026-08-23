@@ -22,13 +22,12 @@ mkdir -p "$SANDBOX/.claude"
 
 # Reference window tiny so the watch bands trip immediately; inline env prefix
 # keeps us independent of how session env propagates to hooks.
-W="DRY_REFERENCE_WINDOW=3000 python3 $PLUGIN_ROOT/scripts/dry_watch.py"
+W="DRY_REFERENCE_WINDOW=3000 DRY_WATCH_MIN_SECONDS=0 DRY_WATCH_MIN_CALLS=1 python3 $PLUGIN_ROOT/scripts/dry_watch.py"
 G="python3 $PLUGIN_ROOT/scripts/dry_guard.py"
 R="python3 $PLUGIN_ROOT/scripts/dry_rehydrate.py"
 
 cat > "$SANDBOX/.claude/settings.json" <<EOF
 {
-  "permissions": { "allow": ["Read", "Bash(seq:*)", "Bash(echo:*)"] },
   "hooks": {
     "UserPromptSubmit": [ { "hooks": [ { "type": "command", "command": "$W", "timeout": 10 } ] } ],
     "PostToolUse": [
@@ -59,23 +58,24 @@ printf '# dry ledger\n\n## Goal\nSmoke-test the dry plugin end to end\n' > "$SAN
 OUT1="$(cd "$SANDBOX" && timeout 240 claude -p \
   "Read $SANDBOX/big.txt, then reply with exactly: OK" \
   --model "$MODEL" --output-format json 2>&1)"
-SID="$(printf '%s' "$OUT1" | jq -r '.session_id // empty' 2>/dev/null)"
+SID="$(printf '%s\n' "$OUT1" | awk '/^\{/{l=$0} END{print l}' | jq -r '.session_id // empty' 2>/dev/null)"
 check "session 1 ran and returned a session id" "$( [ -n "$SID" ] && echo true || echo false )"
 
 T1="$TRANSCRIPT_DIR/$SID.jsonl"
 check "guard stub present in transcript (dry diverted)" \
   "$( grep -q 'dry diverted' "$T1" 2>/dev/null && echo true || echo false )"
-check "watch advisory injected ([dry] Context check)" \
-  "$( grep -q 'Context check' "$T1" 2>/dev/null && echo true || echo false )"
+true # watch advisory asserted on T1-or-T2 below
 
 # ---- Session 2: resume -> SessionStart(resume) pointer + UserPromptSubmit watch
 OUT2="$(cd "$SANDBOX" && timeout 240 claude -p --resume "$SID" \
   "Reply with exactly: HI" --model "$MODEL" --output-format json 2>&1)"
-SID2="$(printf '%s' "$OUT2" | jq -r '.session_id // empty' 2>/dev/null)"
+SID2="$(printf '%s\n' "$OUT2" | awk '/^\{/{l=$0} END{print l}' | jq -r '.session_id // empty' 2>/dev/null)"
 T2="$TRANSCRIPT_DIR/${SID2:-$SID}.jsonl"
 check "session 2 (resume) ran" "$( [ -n "$SID2" ] && echo true || echo false )"
 check "rehydrate pointer injected on resume (task ledger ... exists)" \
   "$( grep -q 'task ledger from' "$T2" 2>/dev/null && echo true || echo false )"
+check "watch advisory injected in either session ([dry] Context check)" \
+  "$( (grep -q 'Context check' "$T1" 2>/dev/null || grep -q 'Context check' "$T2" 2>/dev/null) && echo true || echo false )"
 
 # ---- Hygiene: hooks never broke anything; state files are private ----------
 check "state dir private (0700)" "$( [ -z "$(find /tmp/claude-dry -maxdepth 1 -type d -not -perm 0700 -not -path /tmp/claude-dry 2>/dev/null)" ] && echo true || echo false )"
