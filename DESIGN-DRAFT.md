@@ -1,4 +1,6 @@
-# Design draft (pre-research hypotheses)
+# Design draft (pre-research hypotheses) — SUPERSEDED by DESIGN.md
+
+> Kept only as a record of what was believed before the research landed. Do not build or review against this file.
 
 *Written 2026-08-23, before research results landed. Purpose: capture design intuitions now so they can be checked against evidence, not to constrain the design. The real DESIGN.md gets written after synthesis.*
 

@@ -11,8 +11,14 @@ Fail-open per the plugin contract: any anomaly -> exit 0, no output.
 from __future__ import annotations
 
 import json
+import os
+import sys
 
-import _common
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    import _common
+except Exception:  # import failure must never break the session
+    sys.exit(0)
 
 TRACK_MIN_CHARS = 2_000  # tool results smaller than this are never hogs
 TOP_KEEP = 5             # hog entries kept in state
@@ -24,7 +30,7 @@ ADVISORIES = (
     "[dry] Context check: ~{tokens:,} tokens (~{pct}% of your {ref:,}-token"
     " working budget). Largest tool results so far: {hogs}. Attention quality"
     " degrades well before hard limits. Consider now: (1) update the task"
-    " ledger — context-ledger skill, .claude/dry/ledger.md; (2) route heavy"
+    " ledger — dry:context-ledger skill, .claude/dry/ledger.md; (2) route heavy"
     " reads/searches through subagents; (3) redirect long command output to"
     " files (cmd > /tmp/out.txt && tail -20 /tmp/out.txt).",
     "[dry] Context check: ~{tokens:,} tokens (~{pct}% of {ref:,}). You are in"

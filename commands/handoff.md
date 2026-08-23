@@ -1,6 +1,7 @@
 ---
 description: Checkpoint the task ledger and recommend the cleanest context reset
 argument-hint: [focus]
+allowed-tools: Bash(python3:*)
 ---
 
 <!-- ${CLAUDE_PLUGIN_ROOT} is documented as resolving anywhere in skill/command content
@@ -20,7 +21,7 @@ Invoke and follow the context-ledger skill (`dry:context-ledger`) to bring `<cwd
 
 The dry status report, captured at invocation time:
 
-!`python3 "${CLAUDE_PLUGIN_ROOT}/scripts/dry_status.py"`
+!`python3 "${CLAUDE_PLUGIN_ROOT}/scripts/dry_status.py" --session "${CLAUDE_SESSION_ID}"`
 
 ## Step 3 — recommendation block
 

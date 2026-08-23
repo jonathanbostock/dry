@@ -121,6 +121,15 @@ def _coerce(default, raw: str):
         return default
 
 
+def _type_ok(default, v) -> bool:
+    """Config value type check; bool is not an acceptable int/float (bool ⊂ int)."""
+    if isinstance(default, bool):
+        return isinstance(v, bool)
+    if isinstance(default, (int, float)):
+        return isinstance(v, (int, float)) and not isinstance(v, bool)
+    return isinstance(v, type(default))
+
+
 def load_config(cwd: str) -> dict:
     cfg = dict(DEFAULTS)
     try:
@@ -129,7 +138,7 @@ def load_config(cwd: str) -> dict:
             user = json.loads(path.read_text(encoding="utf-8"))
             if isinstance(user, dict):
                 for k, v in user.items():
-                    if k in cfg and isinstance(v, type(cfg[k])):
+                    if k in cfg and _type_ok(cfg[k], v):
                         cfg[k] = v
     except Exception:
         log_debug(f"config.json ignored:\n{traceback.format_exc()}")
@@ -186,13 +195,14 @@ def transcript_context_tokens(path: str) -> dict | None:
         with open(path, "rb") as f:
             f.seek(0, os.SEEK_END)
             size = f.tell()
-            f.seek(max(0, size - TRANSCRIPT_TAIL_BYTES))
+            offset = max(0, size - TRANSCRIPT_TAIL_BYTES)
+            f.seek(offset)
             chunk = f.read()
     except OSError:
         return None
     lines = chunk.split(b"\n")
-    if len(lines) > 1:
-        lines = lines[1:]  # first line may be partial after the seek
+    if offset > 0 and len(lines) > 1:
+        lines = lines[1:]  # first line is partial only after a mid-file seek
     for raw in reversed(lines):
         raw = raw.strip()
         if not raw:
@@ -201,7 +211,18 @@ def transcript_context_tokens(path: str) -> dict | None:
             rec = json.loads(raw)
         except Exception:
             continue
-        if not isinstance(rec, dict) or rec.get("type") != "assistant":
+        if not isinstance(rec, dict):
+            continue
+        if rec.get("type") == "system" and rec.get("subtype") == "compact_boundary":
+            # Compaction rewrote the conversation: any usage record behind this
+            # boundary is pre-compact and would read stale-high. Use the
+            # boundary's own post-compaction count when present, else unknown.
+            meta = rec.get("compactMetadata")
+            post = meta.get("postTokens") if isinstance(meta, dict) else None
+            if isinstance(post, (int, float)) and not isinstance(post, bool) and post > 0:
+                return {"tokens": int(post), "model": None}
+            return None
+        if rec.get("type") != "assistant":
             continue
         if rec.get("isSidechain"):
             continue

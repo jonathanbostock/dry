@@ -12,7 +12,7 @@ allowed-tools: Bash(python3:*)
 
 ## dry status report
 
-!`python3 "${CLAUDE_PLUGIN_ROOT}/scripts/dry_status.py"`
+!`python3 "${CLAUDE_PLUGIN_ROOT}/scripts/dry_status.py" --session "${CLAUDE_SESSION_ID}"`
 
 ## Your task
 

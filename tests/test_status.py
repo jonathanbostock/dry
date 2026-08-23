@@ -192,7 +192,8 @@ def test_ledger_without_goal_and_empty_state(tmp_path):
     write_transcript(project_transcripts_dir(tmp_path, cwd) / f"{sid}.jsonl", 20_000)
     result = run_status(["--cwd", str(cwd), "--session", sid], tmp_path)
     out = result.stdout.decode()
-    assert "goal: unknown" in out
+    # goal falls back to the first content line, matching dry_rehydrate.extract_goal
+    assert "goal: just notes" in out
     assert "2 lines" in out
     assert "none tracked yet" in out  # sid known, no watch state recorded
     assert "band: ok" in out

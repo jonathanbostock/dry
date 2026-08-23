@@ -73,7 +73,7 @@ A downward jump in usage means a compaction happened; bands re-arm automatically
 
 ## Compaction protocol
 
-You CANNOT run /compact yourself — the Skill tool excludes built-in commands (verified platform limitation). Instead:
+You CANNOT run /compact yourself — the Skill tool exposes only a few built-ins (such as /init) and /compact is not among them (verified platform limitation). Instead:
 
 1. Bring the ledger fully current.
 2. Propose compaction to the user, with keep/drop instructions derived from the ledger. For example:

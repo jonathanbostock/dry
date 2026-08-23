@@ -23,37 +23,37 @@ Three deterministic legs plus a judgement layer. Every hook wraps its body in a 
 
 ### SEE — `scripts/dry_watch.py` (agent-side context visibility)
 
-- **Events:** `UserPromptSubmit` (every prompt) and `PostToolUse` matcher `*` (the main path during long autonomous turns; throttled — a full check only every ≥25 tool calls or ≥60 s, otherwise it exits in milliseconds).
-- **Signal:** context tokens (read from the transcript tail's `message.usage`) over a *reference window* of `min(model window, 200k)` — degradation and prompt-cache economics set the budget, not the 1M ceiling.
-- **Trigger:** edge-triggered bands at 50/70/85%. An advisory is injected once per band, on upward crossing only; a downward jump means compaction happened and the bands re-arm.
-- **Injected** (`additionalContext`, self-capped ≤ ~700 chars, plugin-generated text only): at 50%, a usage report, the top-3 largest tool results seen (tool, size, when), and a menu — update ledger, subagent the heavy reads, divert big outputs to files. At 70%: "finish the current subtask, update the ledger, then recommend the user compact at this boundary; auto-compact will not be graceful." At 85%: "checkpoint NOW; propose `/compact` to the user with instructions derived from the ledger."
+- **Events:** `UserPromptSubmit` (every prompt) and `PostToolUse` matcher `*` (the main path during long autonomous turns; throttled — a full check only every ≥25 tool calls or ≥60 s; a throttled call costs one interpreter start, ~70 ms measured on this box).
+- **Signal:** context tokens (read cache-aware from the transcript tail's `message.usage`; after a compaction boundary the reading is "unknown" until the next assistant turn, never stale-high) against a fixed *reference budget* (`reference_window`, default 200,000 tokens) — deliberately independent of the model's real ceiling: degradation and prompt-cache economics set the budget, not the 1M window.
+- **Trigger:** edge-triggered bands at 50/70/85% of the reference budget. An advisory is injected once per band, on upward crossing only; a downward jump means compaction happened and the bands re-arm.
+- **Injected** (`additionalContext`, hard-capped under 1,000 chars — the three advisories measure 337–429 — plugin-generated text only): at 50%, the usage numbers, the top-3 largest tool results seen (tool and size), and a menu — update the ledger (dry:context-ledger skill), subagent the heavy reads, divert big outputs to files. At 70%: finish the current subtask, update the ledger, then recommend a boundary compaction (or `/clear`; rehydration is automatic). At 85%: checkpoint immediately, keep further output minimal, and propose `/compact` with ledger-derived instructions in the next user-facing message. Exact strings: `ADVISORIES` in [scripts/dry_watch.py](scripts/dry_watch.py).
 - **Files written:** `/tmp/claude-dry/<session-id>/state.json` (throttle clock, last band, rolling top-K result sizes — tool names and byte counts only, never content).
 
 ### AVOID — `scripts/dry_guard.py` (reversible oversized-result diversion)
 
 - **Event:** `PostToolUse`, matcher `Bash|Read|Grep|Glob|WebFetch|WebSearch`.
-- **Trigger:** serialized `tool_response` over 16,000 chars (~4k tokens).
-- **Never diverts:** image results; error-ish results (Bash with non-empty stderr, or interrupted — threshold ×3, and stderr is always preserved in full up to the tail cap, because errors must stay visible); anything already stubbed; any response shape it does not positively recognize (unknown shape ⇒ exit 0 — and Claude Code ignores malformed rewrites anyway, so this path is doubly fail-open).
-- **Action:** the full original is written to `<project>/.claude/dry/archive/<sid8>/<seq>-<tool>.txt` with a 3-line header (tool, timestamp, input summary). What enters context instead is the first 6,000 chars, then the stub line, then the last 4,000 chars. The stub reads:
+- **Trigger:** the response's one big field — Bash `stdout`, Read `file.content`, WebFetch `result` — over 16,000 chars (~4k tokens), and larger than head+tail, so a stub can never exceed the original.
+- **Never diverts:** image results; unknown response shapes (only positively-identified shapes are rewritten, and Claude Code ignores malformed rewrites anyway — doubly fail-open); anything already stubbed. Error-ish Bash results (non-empty stderr, or interrupted) divert only reluctantly, at 3× the threshold, and stderr itself is never touched — errors stay visible.
+- **Action:** what enters context is the first 6,000 chars, the marker, then the last 4,000 chars. The marker (exact template):
 
   ```
-  …
-  [dry diverted N chars → <path> — Read/Grep it if you need the rest]
+  [dry diverted 20,000 of 30,000 chars. <pointer>. Middle omitted — retrieve what you need rather than re-running the command.]
   ```
 
-- **Reversal:** one `Read` or `Grep` of the archived file. Nothing is ever lost, only relocated.
+  The pointer depends on the tool. **Bash:** when native truncation already persisted the full output, the pointer cites Claude Code's own `persistedOutputPath` (no duplicate copy); otherwise dry archives to `<project>/.claude/dry/archive/<sid8>/<utc-stamp>-bash.txt` (3-line header: tool, timestamp, command). **Read:** points back at the source file with offset/limit instructions — the file *is* the archive; nothing is copied. **WebFetch:** archives the fetched result.
+- **Reversal:** one `Read` or `Grep` of the pointed-at path. Nothing is ever lost, only relocated.
 
 ### RESET — `scripts/dry_checkpoint.py` + `scripts/dry_rehydrate.py`
 
-- **`PreCompact`** (manual and auto): gzip-copies the full transcript to `<project>/.claude/dry/snapshots/<utc>-<sid8>-<trigger>.jsonl.gz`, pruning to the last 10. On an *auto* trigger it additionally appends one line to the ledger — `⚠ auto-compact fired <utc> — snapshot: <path>` — so the post-compaction agent learns an ungraceful compaction happened. Never blocks compaction (blocking an error-recovery auto-compact would fail the request).
-- **`PostCompact`**: saves the native `compact_summary` to `snapshots/<utc>-summary.md` — an audit trail of what compaction actually kept. Side effect only; this event carries no injection channel.
-- **`SessionStart` matcher `compact`**: injects the ledger content (capped at 6,000 chars, else head + pointer) behind a fixed preamble: "Compaction just occurred; the native summary may have dropped specifics. The ledger below and snapshot on disk are authoritative. Re-read before continuing."
+- **`PreCompact`** (manual and auto): gzip-copies the full transcript to `<project>/.claude/dry/snapshots/<utc>-<sid8>-<trigger>.jsonl.gz`, pruning to the last 10. On an *auto* trigger (and only when the snapshot actually succeeded) it appends one line to the ledger — `- ⚠ <utc-iso>: auto-compact fired mid-task; pre-compact snapshot: <path>` — so the post-compaction agent learns an ungraceful compaction happened. Never blocks compaction (blocking an error-recovery auto-compact would fail the request).
+- **`PostCompact`**: saves the native `compact_summary` to `snapshots/<utc>-<sid8>-summary-<trigger>.md` — an audit trail of what compaction actually kept. Side effect only; this event carries no injection channel.
+- **`SessionStart` matcher `compact`**: injects the ledger content (capped at 6,000 chars, else head + truncation marker) behind the fixed preamble: "[dry] Context was just compacted. The native summary above may have dropped specifics. The task ledger below is authoritative (full pre-compact transcript snapshot: `<path>`). Re-read it before continuing."
 - **`SessionStart` matcher `clear|resume`**: injects a one-line pointer only — ledger path, its `## Goal` first line, and its age — and only if the ledger exists and is under 7 days old. New tasks don't inherit a stale ledger's weight; resumed ones recover it in one `Read`.
 - **`SessionStart` matcher `startup`**: deliberately not hooked — CLAUDE.md and auto-memory own cold starts.
 
 ### Judgement — the `context-ledger` skill and two commands
 
-[`skills/context-ledger/SKILL.md`](skills/context-ledger/SKILL.md) is the layer the deterministic legs exist to serve: it teaches the agent to keep a delta-based ledger at `<project>/.claude/dry/ledger.md` (Goal / Now / Done / Decisions / Files / Gotchas / Next), to recite Now+Next after each update, to answer each watch band with a fixed playbook, and to *propose* `/compact` with ledger-derived keep/drop instructions at task boundaries — the model cannot invoke `/compact` itself (the Skill tool excludes built-ins; verified). `/dry:status` embeds a live report from `scripts/dry_status.py` and interprets it; `/dry:handoff [focus]` checkpoints the ledger and ends with a compact/clear/keep-going recommendation.
+[`skills/context-ledger/SKILL.md`](skills/context-ledger/SKILL.md) is the layer the deterministic legs exist to serve: it teaches the agent to keep a delta-based ledger at `<project>/.claude/dry/ledger.md` (Goal / Now / Done / Decisions / Files / Gotchas / Next), to recite Now+Next after each update, to answer each watch band with a fixed playbook, and to *propose* `/compact` with ledger-derived keep/drop instructions at task boundaries — the model cannot invoke `/compact` itself (the Skill tool exposes only a few built-ins such as `/init`; `/compact` is not among them — verified). `/dry:status` embeds a live report from `scripts/dry_status.py` and interprets it; `/dry:handoff [focus]` checkpoints the ledger and ends with a compact/clear/keep-going recommendation.
 
 ## Repo map
 
@@ -111,7 +111,9 @@ claude plugin marketplace add /workspace/claude-memory-management
 claude plugin install dry@dry --scope user
 ```
 
-Restart any running sessions afterwards — hook configuration is cached per session, so live sessions won't pick the hooks up. To remove: `claude plugin uninstall dry@dry`, then `claude plugin marketplace remove dry` (confirm exact subcommand spellings against `claude plugin --help` for your version).
+Restart any running sessions afterwards — hook configuration is cached per session, so live sessions won't pick the hooks up. To remove: `claude plugin uninstall dry@dry`, then `claude plugin marketplace remove dry` (both verified against v2.1.241). Uninstalling leaves `<project>/.claude/dry/` and `/tmp/claude-dry/` behind; delete them by hand for a clean slate.
+
+**First run in a project: expect silence.** Nothing is visible until a band trips or a >16k tool result appears; the ledger doesn't exist until the skill (or you) creates it; and on a first compaction with no ledger the agent gets a one-line nudge to create one. Quiet is the intended default.
 
 The hooks can also be smoke-tested *without* installing: point a sandbox project's `.claude/settings.json` at the scripts by absolute path (the same wiring as `hooks/hooks.json`, minus `${CLAUDE_PLUGIN_ROOT}`). Plugin packaging is only needed for the skill, the commands, and distribution.
 
@@ -123,7 +125,12 @@ uv run --no-project --with pytest pytest tests/ -q
 
 Unit tests run every hook script as a subprocess on fixture stdin: band edge-triggering (up-crossings, down-reset, no re-fire), throttling, guard thresholds, protections and shape fidelity, checkpoint pruning, rehydrate caps and age gates, and the fail-open contract (malformed/huge/missing inputs, unwritable dirs ⇒ all exit 0). Fixtures were captured from a real probe session, not hand-written.
 
-The live smoke (a sandbox project wiring the hooks via `.claude/settings.json`) covered: a huge `seq` output producing a stub in the transcript plus the archive file on disk; `DRY_REFERENCE_WINDOW=3000` making a band advisory appear; a session with a ledger followed by `claude -p --resume` showing the injected pointer; and `claude plugin validate .` passing.
+Two live smokes run real headless sessions in a sandbox project, wiring the hooks via `.claude/settings.json` (model pinned; each costs a few API calls):
+
+- `tests/smoke_live.sh` (6/6 passed): an oversized `Read` produces the diversion stub in the actual session transcript; a watch advisory appears (tiny `DRY_REFERENCE_WINDOW`); `claude -p --resume` triggers the SessionStart(resume) ledger pointer; state dirs land 0700.
+- `tests/smoke_compact.sh` (6/6 passed): forces a **real auto-compact** with `--autocompact 100000` and observes the full choreography — the PreCompact(auto) snapshot written and gunzipping cleanly, the ⚠ marker appended to the ledger (proving the `trigger` field), PostCompact's `compact_summary` audit file written (proving that field), and the post-compaction SessionStart injection. The compaction-path field names are live-verified, not doc-derived.
+
+`claude plugin validate .` passes (run separately; not part of the smokes).
 
 ## Security posture
 
@@ -145,6 +152,8 @@ The live smoke (a sandbox project wiring the hooks via `.claude/settings.json`) 
 
 ## Known unknowns
 
-- `tool_response` shapes for Grep/Glob were not captured by the fixture probe on this box (Bash/Read/WebFetch were) — the guard rewrites only positively-identified shapes and passes everything else through untouched, so the miss costs coverage, not correctness.
-- `additionalContext` size etiquette is undocumented upstream — dry self-caps at ~700 chars (watch) and 6,000 chars (rehydrate).
-- PreCompact firing on manual `/compact` had a disputed upstream issue — it is observed in the live smoke rather than assumed, and the checkpoint is belt-and-braces anyway: the ledger alone suffices for recovery.
+- `tool_response` shapes for Grep/Glob/WebSearch were not captured by the fixture probe on this box (they are deferred tools here; Bash/Read/WebFetch were captured) — the guard rewrites only positively-identified shapes and passes everything else through untouched, so the miss costs coverage, not correctness.
+- `additionalContext` size etiquette is undocumented upstream — dry self-caps under 1,000 chars (watch) and 6,000 chars (rehydrate).
+- PreCompact on a *manual* `/compact` is unit-tested but not live-observed (the forced live compaction was an auto trigger; `-p` mode can't type `/compact`). The auto path — the one that matters for unattended long tasks — is live-verified end to end.
+- Two accepted small races, both self-correcting within a turn: parallel tool calls can double-emit one band advisory (state is last-writer-wins), and between a compaction and the next assistant turn the token reading is "unknown" rather than a number.
+- Per-call overhead measured on this box: ~70 ms for a throttled watch call, ~140 ms for watch+guard on a matched call (Python startup dominates). If that ever matters, narrow the PostToolUse matchers.

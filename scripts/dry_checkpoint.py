@@ -22,18 +22,23 @@ from __future__ import annotations
 import gzip
 import os
 import shutil
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from _common import (
-    atomic_write,
-    fail_open,
-    load_config,
-    log_debug,
-    now_stamp,
-    project_dry_dir,
-    read_stdin_json,
-)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    from _common import (
+        atomic_write,
+        fail_open,
+        load_config,
+        log_debug,
+        now_stamp,
+        project_dry_dir,
+        read_stdin_json,
+    )
+except Exception:  # import failure must never break the session
+    sys.exit(0)
 
 
 def utc_iso() -> str:

@@ -128,3 +128,14 @@ claude plugin install dry@dry        # exact syntax verified during build
 - PreCompact reliability on manual `/compact` had a disputed upstream issue → smoke-tests observe it; checkpoint is belt-and-braces anyway (ledger alone suffices for recovery).
 - Throttle counter writes on every PostToolUse (~10–30 ms Python startup per tool call) — measure in smoke; if noticeable, raise matcher specificity or sampling.
 - Multiple concurrent sessions in one project share the ledger by design (rare here); entries are timestamped.
+
+## 9. As-built notes (post-review, same day)
+
+Where the build deviated from §4, deliberately and review-approved — the code is the contract now:
+
+- **Guard:** marker template finalized in `dry_guard.py` (supersedes §4.3's sketch); extra trigger condition `len > head+tail` so a stub can never exceed the original; Bash reuses the native `persistedOutputPath` instead of duplicating archives; Read points back at the source file (no copy); archives named `<utc-stamp>-<tool>.txt` with O_EXCL collision suffixes.
+- **Watch:** fresh-session state initializes the throttle clock, so a session's first PostToolUse throttles (UserPromptSubmit covers turn starts); hogs track (tool, size) only; advisory cap is 999 chars (the three advisories measure 337–429); a throttled call costs ~70 ms, not the hoped <20 ms — interpreter startup dominates.
+- **Reference window:** implemented as a flat configured budget (default 200k), not `min(model window, 200k)` — same effect on every current model, one less moving part.
+- **Checkpoint:** the auto-compact ledger marker is written only when the snapshot succeeded; PostCompact archives the native `compact_summary` (field live-verified by `tests/smoke_compact.sh`, which forces a real auto-compact via `--autocompact 100000`).
+- **_common hardening from adversarial review:** compaction boundaries in the transcript now yield postTokens or "unknown" (never stale-high); config rejects bools for numeric keys; sub-1MiB transcripts keep their first line; every hook survives even import failure (exit 0); ledger reads are bounded (64 KiB) before capping.
+- **Review outcome:** no critical or major findings; seven minors — five fixed, two accepted and documented (parallel-call advisory double-emit; archives unpruned). Final state: 86 unit tests, two live smokes (6/6 and 6/6, the second forcing a real auto-compact), `claude plugin validate` clean.

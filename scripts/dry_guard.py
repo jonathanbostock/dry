@@ -24,14 +24,17 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from _common import (
-    emit,
-    fail_open,
-    load_config,
-    now_stamp,
-    project_dry_dir,
-    read_stdin_json,
-)
+try:
+    from _common import (
+        emit,
+        fail_open,
+        load_config,
+        now_stamp,
+        project_dry_dir,
+        read_stdin_json,
+    )
+except Exception:  # import failure must never break the session
+    sys.exit(0)
 
 # Idempotence sentinel: a field already carrying this is never diverted again.
 MARKER_TAG = "[dry diverted"

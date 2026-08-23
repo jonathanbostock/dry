@@ -1,4 +1,7 @@
-# Claude Code Plugin & Hooks API Reference v2.1.241
+# Claude Code Plugin & Hooks API Reference
+
+> **CORRECTIONS (2026-08-23, post-build).** Live behavior on v2.1.241 disagrees with this report in several places, all empirically verified during the dry build (captured fixtures plus a forced real auto-compact):
+> SessionStart's input field is `source` (not `session_start_type`); PreCompact's input fields are `trigger` and `custom_instructions` (not `compaction_trigger`); PostCompact's input carries `trigger` and `compact_summary` (not `new_token_count`/`tokens_removed`); Stop hooks CAN inject via `hookSpecificOutput.additionalContext` (the matrix below says NO); and transcripts mark compactions with a `type:"system", subtype:"compact_boundary"` record carrying `compactMetadata.{trigger,preTokens,…}`. The code in `scripts/` follows live behavior — trust it over this report where they differ. v2.1.241
 
 Build-ready API specification for Claude Code plugins. Ground truth from v2.1.241 (`claude --version`), live docs at https://code.claude.com/docs/en/, and verified against real installed plugins (arch2, claude-plugins-official).
 

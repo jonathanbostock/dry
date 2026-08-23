@@ -12,12 +12,18 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import sys
 from pathlib import Path
 
-import _common
-import dry_watch
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    import _common
+    import dry_rehydrate
+    import dry_watch
+except Exception:  # import failure must never break the session or command
+    sys.exit(0)
 
-LEDGER_READ_MAX = 1024 * 1024
+LEDGER_READ_MAX = 64 * 1024
 
 BAND_NAMES = ("advisory", "degradation", "critical")
 
@@ -109,16 +115,10 @@ def ledger_line(ledger: Path) -> str:
     if not ledger.is_file():
         return "none (.claude/dry/ledger.md)"
     age = humanize_age(_common.wall() - ledger.stat().st_mtime)
-    text = ledger.read_text(encoding="utf-8", errors="replace")[:LEDGER_READ_MAX]
+    with open(ledger, encoding="utf-8", errors="replace") as f:
+        text = f.read(LEDGER_READ_MAX)
     lines = text.splitlines()
-    goal = "unknown"
-    for i, line in enumerate(lines):
-        if line.strip().startswith("## Goal"):
-            for follower in lines[i + 1:]:
-                if follower.strip():
-                    goal = follower.strip()
-                    break
-            break
+    goal = _common.cap_text(dry_rehydrate.extract_goal(text), 150, "…")
     return f".claude/dry/ledger.md — {age} old, {len(lines)} lines — goal: {goal}"
 
 

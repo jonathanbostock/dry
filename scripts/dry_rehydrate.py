@@ -18,18 +18,24 @@ Injected text is plugin-generated phrasing plus content of dry's own files
 from __future__ import annotations
 
 import os
+import sys
 import time
 from pathlib import Path
 
-from _common import (
-    cap_text,
-    emit,
-    fail_open,
-    load_config,
-    project_dry_dir,
-    read_stdin_json,
-)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    from _common import (
+        cap_text,
+        emit,
+        fail_open,
+        load_config,
+        project_dry_dir,
+        read_stdin_json,
+    )
+except Exception:  # import failure must never break the session
+    sys.exit(0)
 
+LEDGER_READ_MAX = 64 * 1024
 LEDGER_CAP = 6_000
 GOAL_CAP = 150
 TRUNCATION_MARKER = "\n[dry: ledger truncated — Read .claude/dry/ledger.md for the rest]"
@@ -55,14 +61,16 @@ def rel_to(path: Path, cwd: str) -> str:
         return str(path)
 
 
+def read_head(path: Path) -> str:
+    """Bounded read: the caps come later, but never load a planted-huge file whole."""
+    with open(path, encoding="utf-8", errors="replace") as f:
+        return f.read(LEDGER_READ_MAX)
+
+
 def compact_context(cwd: str, ledger: Path) -> str:
     if not ledger.is_file():
         return NO_LEDGER_MSG
-    text = cap_text(
-        ledger.read_text(encoding="utf-8", errors="replace"),
-        LEDGER_CAP,
-        TRUNCATION_MARKER,
-    )
+    text = cap_text(read_head(ledger), LEDGER_CAP, TRUNCATION_MARKER)
     snap = newest_snapshot(project_dry_dir(cwd) / "snapshots")
     snapnote = ""
     if snap is not None:
@@ -108,11 +116,7 @@ def pointer_context(cfg: dict, ledger: Path) -> str | None:
     age = time.time() - ledger.stat().st_mtime
     if age >= cfg["ledger_pointer_max_age_days"] * 86400:
         return None
-    goal = cap_text(
-        extract_goal(ledger.read_text(encoding="utf-8", errors="replace")),
-        GOAL_CAP,
-        "…",
-    )
+    goal = cap_text(extract_goal(read_head(ledger)), GOAL_CAP, "…")
     return (
         f"[dry] A task ledger from {humanize_age(age)} exists at "
         f".claude/dry/ledger.md (goal: {goal}). Read it first if you are "
