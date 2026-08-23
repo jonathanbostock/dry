@@ -1,0 +1,9 @@
+{
+  "name": "dry",
+  "version": "0.1.0",
+  "description": "Deterministic context keeping for Claude Code: agent-side context visibility (edge-triggered usage advisories), reversible diversion of oversized tool results to disk, pre-compaction transcript snapshots, automatic post-compaction/clear rehydration from a task ledger, and a judgement skill for delta-based ledger keeping. No LLM calls, no daemon, no dependencies.",
+  "author": {
+    "name": "Jonathan Bostock",
+    "email": "jonathan@arcadiaimpact.org"
+  }
+}

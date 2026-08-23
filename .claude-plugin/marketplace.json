@@ -1,0 +1,22 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "dry",
+  "description": "Local marketplace for the dry context-keeping plugin.",
+  "owner": {
+    "name": "Jonathan Bostock",
+    "email": "jonathan@arcadiaimpact.org"
+  },
+  "plugins": [
+    {
+      "name": "dry",
+      "description": "Deterministic context keeping for Claude Code: agent-side context visibility, reversible oversized-result diversion, pre-compaction snapshots, automatic rehydration, and a ledger-keeping judgement skill.",
+      "version": "0.1.0",
+      "author": {
+        "name": "Jonathan Bostock",
+        "email": "jonathan@arcadiaimpact.org"
+      },
+      "category": "productivity",
+      "source": "./"
+    }
+  ]
+}
