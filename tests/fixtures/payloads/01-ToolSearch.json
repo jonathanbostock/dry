@@ -1,0 +1,25 @@
+{
+ "session_id": "a8ba0f4e-438f-4a93-853e-61bc793d52f5",
+ "transcript_path": "/root/.claude/projects/-tmp-dry-probe/a8ba0f4e-438f-4a93-853e-61bc793d52f5.jsonl",
+ "cwd": "/tmp/dry-probe",
+ "prompt_id": "abaa2a02-ef9d-40fb-ade0-2510fe3a4b65",
+ "permission_mode": "auto",
+ "effort": {
+  "level": "medium"
+ },
+ "hook_event_name": "PostToolUse",
+ "tool_name": "ToolSearch",
+ "tool_input": {
+  "query": "select:Grep,Glob,WebFetch",
+  "max_results": 5
+ },
+ "tool_response": {
+  "matches": [
+   "WebFetch"
+  ],
+  "query": "select:Grep,Glob,WebFetch",
+  "total_deferred_tools": 14
+ },
+ "tool_use_id": "toolu_01UqCzLNE9j1HT7FJjxR96of",
+ "duration_ms": 5
+}

@@ -1,0 +1,25 @@
+{
+ "session_id": "a8ba0f4e-438f-4a93-853e-61bc793d52f5",
+ "transcript_path": "/root/.claude/projects/-tmp-dry-probe/a8ba0f4e-438f-4a93-853e-61bc793d52f5.jsonl",
+ "cwd": "/tmp/dry-probe",
+ "prompt_id": "abaa2a02-ef9d-40fb-ade0-2510fe3a4b65",
+ "permission_mode": "auto",
+ "effort": {
+  "level": "medium"
+ },
+ "hook_event_name": "PostToolUse",
+ "tool_name": "Bash",
+ "tool_input": {
+  "command": "ls /tmp/dry-probe/data/*.txt",
+  "description": "List .txt files in /tmp/dry-probe/data"
+ },
+ "tool_response": {
+  "stdout": "/tmp/dry-probe/data/a.txt\n/tmp/dry-probe/data/b.txt",
+  "stderr": "",
+  "interrupted": false,
+  "isImage": false,
+  "noOutputExpected": false
+ },
+ "tool_use_id": "toolu_01Qqxg8E3LQ6F99SP4qi3RoD",
+ "duration_ms": 16
+}
