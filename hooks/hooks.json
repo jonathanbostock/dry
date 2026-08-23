@@ -38,6 +38,11 @@
         "hooks": [
           {
             "type": "command",
+            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/scripts/dry_gate.py",
+            "timeout": 15
+          },
+          {
+            "type": "command",
             "command": "python3 ${CLAUDE_PLUGIN_ROOT}/scripts/dry_checkpoint.py",
             "timeout": 60
           }

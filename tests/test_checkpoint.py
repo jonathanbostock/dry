@@ -110,7 +110,12 @@ def test_precompact_auto_appends_ledger(tmp_path):
     assert len(snaps) == 1
     assert os.path.relpath(snaps[0], proj) in content
     # a second auto compaction appends without duplicating the header
-    run_hook(tmp_path, pre_compact_payload(proj, transcript, trigger="auto"))
+    # (interval override: back-to-back snapshots are throttled by default)
+    run_hook(
+        tmp_path,
+        pre_compact_payload(proj, transcript, trigger="auto"),
+        extra_env={"DRY_SNAPSHOT_MIN_INTERVAL_SECONDS": "0"},
+    )
     content = ledger.read_text(encoding="utf-8")
     assert content.count("# dry ledger") == 1
     assert content.count("auto-compact fired mid-task") == 2
@@ -124,7 +129,11 @@ def test_prune_keeps_newest(tmp_path):
     for i in range(12):
         name = f"20250101T{i:02d}0000Z-deadbeef-auto.jsonl.gz"
         (sd / name).write_bytes(gzip.compress(f"old {i}".encode()))
-    proc = run_hook(tmp_path, pre_compact_payload(proj, transcript))
+    proc = run_hook(
+        tmp_path,
+        pre_compact_payload(proj, transcript),
+        extra_env={"DRY_SNAPSHOT_MIN_INTERVAL_SECONDS": "0"},
+    )
     assert proc.returncode == 0
     remaining = sorted(p.name for p in sd.glob("*.jsonl.gz"))
     assert len(remaining) == 10
@@ -143,7 +152,7 @@ def test_prune_respects_config(tmp_path):
     proc = run_hook(
         tmp_path,
         pre_compact_payload(proj, transcript),
-        extra_env={"DRY_SNAPSHOTS_KEEP": "2"},
+        extra_env={"DRY_SNAPSHOTS_KEEP": "2", "DRY_SNAPSHOT_MIN_INTERVAL_SECONDS": "0"},
     )
     assert proc.returncode == 0
     remaining = sorted(p.name for p in sd.glob("*.jsonl.gz"))

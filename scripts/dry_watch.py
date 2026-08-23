@@ -109,6 +109,29 @@ def build_advisory(band: int, tokens: int, ref: int, top: list) -> str:
     return _common.cap_text(text, ADVISORY_MAX)
 
 
+PENDING_NOTICE = (
+    "[dry] A gated auto-compact is pending — dry_gate deferred it for you."
+    " Finish the current step, bring .claude/dry/ledger.md current, then"
+    " release it by running: touch .claude/dry/compact-ok — compaction"
+    " proceeds at that boundary. (A failsafe releases automatically near the"
+    " window limit.)"
+)
+
+
+def pending_notice(cwd: str, watch: dict) -> str | None:
+    """One notice per gate episode: keyed on the pending marker's mtime."""
+    marker = _common.project_dry_dir(cwd) / "compact-pending"
+    try:
+        mtime = int(marker.stat().st_mtime)
+    except OSError:
+        watch.pop("pending_seen", None)
+        return None
+    if watch.get("pending_seen") == mtime:
+        return None
+    watch["pending_seen"] = mtime
+    return PENDING_NOTICE
+
+
 def full_check(data: dict, cfg: dict, watch: dict) -> str | None:
     """Measure context, update band state; return advisory text or None."""
     watch["calls_since"] = 0
@@ -141,7 +164,11 @@ def main() -> None:
         return
     state = _common.load_state(session_id)
     watch = watch_state(state)
+    # The gate's pending marker outranks throttling: the agent must learn
+    # promptly that a deferred compaction is waiting on it.
+    notice = pending_notice(data["cwd"], watch)
 
+    text = None
     if event == "PostToolUse":
         watch["calls_since"] += 1
         size = len(json.dumps(data.get("tool_response"), default=str))
@@ -151,18 +178,19 @@ def main() -> None:
         throttled = (
             watch["calls_since"] < cfg["watch_min_calls"]
             and 0 <= delta < cfg["watch_min_seconds"]
-        )
-        if throttled:  # negative delta = clock jump = treat as expired
-            _common.save_state(session_id, state)
-            return
+        )  # negative delta = clock jump = treat as expired
+        if not throttled:
+            text = full_check(data, cfg, watch)
+    else:
+        text = full_check(data, cfg, watch)
 
-    text = full_check(data, cfg, watch)
     _common.save_state(session_id, state)
-    if text:
+    combined = "\n\n".join(t for t in (notice, text) if t)
+    if combined:
         _common.emit({
             "hookSpecificOutput": {
                 "hookEventName": event,
-                "additionalContext": text,
+                "additionalContext": combined,
             }
         })
 

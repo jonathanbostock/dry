@@ -51,6 +51,19 @@ Three deterministic legs plus a judgement layer. Every hook wraps its body in a 
 - **`SessionStart` matcher `clear|resume`**: injects a one-line pointer only — ledger path, its `## Goal` first line, and its age — and only if the ledger exists and is under 7 days old. New tasks don't inherit a stale ledger's weight; resumed ones recover it in one `Read`.
 - **`SessionStart` matcher `startup`**: deliberately not hooked — CLAUDE.md and auto-memory own cold starts.
 
+### GATE — `scripts/dry_gate.py` (opt-in self-compaction for autonomous runs)
+
+The model cannot trigger `/compact` — but a PreCompact hook can *defer* a proactive auto-compact (exit 2), and blocked attempts retry (live-verified: 5–6 PreCompact(auto) attempts per session). The gate inverts control:
+
+- Launch autonomous runs with `DRY_GATE=1 claude --autocompact 300000` — past the window, a compaction is effectively always pending.
+- The gate defers each auto attempt and leaves a marker; `dry_watch` injects a one-time in-context notice telling the agent a compaction is waiting on it.
+- At a clean boundary the agent updates the ledger and runs `touch .claude/dry/compact-ok`; the next attempt (typically the next turn) passes through, consuming the flag one-shot.
+- Failsafes, all pointing toward ALLOW: manual `/compact` is never blocked; a stale flag (>60 min) is ignored; if the agent never releases, the gate stands aside near the model's real window (90% by default, 200k window assumed for Haiku or `CLAUDE_CODE_DISABLE_1M_CONTEXT`); when it can't read the transcript, it allows; any internal error allows. Nothing can strand a session.
+
+Live-verified end to end (`tests/smoke_gate.sh`, 8/8): six gate invocations, four deferred, **two agent-released compaction cycles in one session** — the agent saw the notice, touched the flag, compaction proceeded at the boundary, rehydration followed, markers cleaned up.
+
+Default **off**: it changes native compaction behavior and relies on the skill-taught release protocol. Enable per-launch (`DRY_GATE=1`) or per-project (`gate_enabled` in config).
+
 ### Judgement — the `context-ledger` skill and two commands
 
 [`skills/context-ledger/SKILL.md`](skills/context-ledger/SKILL.md) is the layer the deterministic legs exist to serve: it teaches the agent to keep a delta-based ledger at `<project>/.claude/dry/ledger.md` (Goal / Now / Done / Decisions / Files / Gotchas / Next), to recite Now+Next after each update, to answer each watch band with a fixed playbook, and to *propose* `/compact` with ledger-derived keep/drop instructions at task boundaries — the model cannot invoke `/compact` itself (the Skill tool exposes only a few built-ins such as `/init`; `/compact` is not among them — verified). `/dry:status` embeds a live report from `scripts/dry_status.py` and interprets it; `/dry:handoff [focus]` checkpoints the ledger and ends with a compact/clear/keep-going recommendation.
@@ -64,6 +77,7 @@ hooks/hooks.json                 all event wiring, ${CLAUDE_PLUGIN_ROOT} paths, 
 scripts/_common.py               shared helpers: fail-open guard, config, transcript token read
 scripts/dry_watch.py             SEE  — band advisories
 scripts/dry_guard.py             AVOID — oversized-result diversion
+scripts/dry_gate.py              GATE  — opt-in agent-released auto-compaction
 scripts/dry_checkpoint.py        RESET — PreCompact/PostCompact snapshots
 scripts/dry_rehydrate.py         RESET — SessionStart ledger injection
 scripts/dry_status.py            report backing /dry:status and /dry:handoff
@@ -90,7 +104,11 @@ Defaults ← `<project>/.claude/dry/config.json` ← `DRY_*` environment variabl
 | `guard_tail_chars` | `DRY_GUARD_TAIL_CHARS` | `4000` |
 | `guard_error_multiplier` | `DRY_GUARD_ERROR_MULTIPLIER` | `3` |
 | `snapshots_keep` | `DRY_SNAPSHOTS_KEEP` | `10` |
+| `snapshot_min_interval_seconds` | `DRY_SNAPSHOT_MIN_INTERVAL_SECONDS` | `60` |
 | `ledger_pointer_max_age_days` | `DRY_LEDGER_POINTER_MAX_AGE_DAYS` | `7` |
+| `gate_enabled` | `DRY_GATE_ENABLED` (alias: `DRY_GATE=1`) | `false` |
+| `gate_flag_max_age_minutes` | `DRY_GATE_FLAG_MAX_AGE_MINUTES` | `60` |
+| `gate_failsafe_fraction` | `DRY_GATE_FAILSAFE_FRACTION` | `0.9` |
 | `disable` | `DRY_DISABLE` | `false` |
 | `disable_watch` | `DRY_DISABLE_WATCH` | `false` |
 | `disable_guard` | `DRY_DISABLE_GUARD` | `false` |
@@ -129,6 +147,7 @@ Two live smokes run real headless sessions in a sandbox project, wiring the hook
 
 - `tests/smoke_live.sh` (6/6 passed): an oversized `Read` produces the diversion stub in the actual session transcript; a watch advisory appears (tiny `DRY_REFERENCE_WINDOW`); `claude -p --resume` triggers the SessionStart(resume) ledger pointer; state dirs land 0700.
 - `tests/smoke_compact.sh` (6/6 passed): forces a **real auto-compact** with `--autocompact 100000` and observes the full choreography — the PreCompact(auto) snapshot written and gunzipping cleanly, the ⚠ marker appended to the ledger (proving the `trigger` field), PostCompact's `compact_summary` audit file written (proving that field), and the post-compaction SessionStart injection. The compaction-path field names are live-verified, not doc-derived.
+- `tests/smoke_gate.sh` (8/8 passed): the full gate protocol with a live agent — deferred auto-compacts retrying, the pending notice delivered, the agent releasing via `compact-ok` at a boundary, compaction proceeding, markers cleaned. Two agent-released compaction cycles observed in one session.
 
 `claude plugin validate .` passes (run separately; not part of the smokes).
 
@@ -141,7 +160,7 @@ Two live smokes run real headless sessions in a sandbox project, wiring the hook
 ## Limitations and non-features
 
 - **No LLM compression of context** — the evidence says cost without quality gain ([arXiv:2605.18854](https://arxiv.org/abs/2605.18854)).
-- **No `/compact` self-invocation** — platform limit: the Skill tool excludes built-in commands, so the skill teaches proposing it to the user instead.
+- **No direct `/compact` self-invocation** — platform limit (the Skill tool doesn't expose it). Interactively, the skill teaches proposing it to the user; for autonomous runs the opt-in gate inverts control — the agent *releases* a pending auto-compact at its chosen boundary, which is self-compaction in all but name.
 - **No transcript surgery** — documented data-loss incidents in the wild; native `--resume` semantics may change underneath.
 - **No statusline** — human-facing context-% is already natively solved.
 - **Archives unpruned in v1** — disk is cheap; `/dry:status` reports archive size so you can clean up by hand.

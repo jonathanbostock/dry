@@ -139,3 +139,14 @@ Where the build deviated from §4, deliberately and review-approved — the code
 - **Checkpoint:** the auto-compact ledger marker is written only when the snapshot succeeded; PostCompact archives the native `compact_summary` (field live-verified by `tests/smoke_compact.sh`, which forces a real auto-compact via `--autocompact 100000`).
 - **_common hardening from adversarial review:** compaction boundaries in the transcript now yield postTokens or "unknown" (never stale-high); config rejects bools for numeric keys; sub-1MiB transcripts keep their first line; every hook survives even import failure (exit 0); ledger reads are bounded (64 KiB) before capping.
 - **Review outcome:** no critical or major findings; seven minors — five fixed, two accepted and documented (parallel-call advisory double-emit; archives unpruned). Final state: 86 unit tests, two live smokes (6/6 and 6/6, the second forcing a real auto-compact), `claude plugin validate` clean.
+
+## 10. Addendum: the self-compaction gate (same day)
+
+Jonathan asked for judgement-call self-compaction in multi-day autonomous (/goal) runs. Direct triggering stays impossible (§4.5), but a live probe established two facts: a PreCompact hook exit-2 skips a proactive auto-compact, and **blocked attempts retry** (five PreCompact(auto) invocations observed in one probe session; the PreCompact payload carries no token fields — `trigger`, `custom_instructions`, session/transcript/cwd only). That makes inverted control viable, shipped as `dry_gate.py` (opt-in, `DRY_GATE=1`):
+
+- Low `--autocompact` window ⇒ a compaction is effectively always pending past the threshold.
+- Gate defers `auto` attempts (never `manual`), leaving a pending marker; `dry_watch` turns the marker into a one-time in-context notice (mtime-deduped) so the agent knows to wrap up.
+- Agent releases at a boundary via a one-shot `compact-ok` flag (60-min staleness cap, always consumed).
+- Failsafes, all toward ALLOW: blind ⇒ allow; ≥90% of the model's real window ⇒ allow; any error ⇒ allow (fail_open). `dry_checkpoint` gained a 60 s snapshot throttle so retrying blocked attempts don't re-gzip the transcript each turn.
+
+Live verification: `tests/smoke_gate.sh` 8/8 — six gate invocations, four deferred, two agent-released compaction cycles in one session (notice delivered → agent touched the flag → compaction at the boundary → rehydration). Suite: 100 unit tests.

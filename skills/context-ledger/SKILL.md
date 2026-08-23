@@ -84,6 +84,17 @@ You CANNOT run /compact yourself — the Skill tool exposes only a few built-ins
 
 The same holds for /clear: recommend it only after a ledger update; dry injects a pointer to the ledger in the fresh session.
 
+## Gated self-compaction (autonomous / goal runs)
+
+When the session was launched with the gate enabled (`DRY_GATE=1` plus a low `--autocompact` window), auto-compacts are deferred until YOU release them — this is your compaction trigger in all but name:
+
+1. A [dry] notice tells you a gated auto-compact is pending.
+2. Finish the current step — do not start a new one.
+3. Bring the ledger fully current (it is what survives).
+4. Release: run `mkdir -p .claude/dry && touch .claude/dry/compact-ok` (one Bash call). Compaction proceeds at that boundary; dry rehydrates you from the ledger afterwards.
+
+Do not touch the flag pre-emptively "for later" — it is one-shot, expires after ~60 minutes, and releasing mid-subtask wastes the whole point. If you never release, a failsafe compacts anyway near the model's real window limit; nothing can strand the session.
+
 ## Archive awareness
 
 Oversized tool results may have been diverted to disk before they ever reached you. Stubs say `[dry diverted ...]` and give a path. When you need the missing middle, Read or Grep the archive (`.claude/dry/archive/` or the exact path in the stub) — do NOT re-run the command; the full original is already on disk.

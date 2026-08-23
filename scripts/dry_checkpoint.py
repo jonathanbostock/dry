@@ -23,6 +23,7 @@ import gzip
 import os
 import shutil
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -103,6 +104,11 @@ def handle_pre_compact(data: dict, cfg: dict) -> None:
         return
     snapdir = dry_dir / "snapshots"
     snapdir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    # Gated runs retry PreCompact every turn while blocked; don't re-gzip a
+    # large transcript on each attempt.
+    newest = max((p.stat().st_mtime for p in snapdir.glob("*.jsonl.gz")), default=0.0)
+    if time.time() - newest < cfg["snapshot_min_interval_seconds"]:
+        return
     dest = snapdir / f"{now_stamp()}-{sid8(data.get('session_id'))}-{safe_name(trigger)}.jsonl.gz"
     if not snapshot_transcript(transcript_path, dest):
         return
