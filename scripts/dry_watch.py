@@ -26,6 +26,8 @@ HOGS_SHOWN = 3           # hog entries shown in an advisory
 TOOL_NAME_MAX = 40       # keep advisory length bounded for long MCP names
 ADVISORY_MAX = 999       # hard cap: every advisory stays under 1000 chars
 
+# Interactive runs (no gate): the user runs /compact or /clear; the agent
+# can only suggest. Kept to one calm line at a boundary.
 ADVISORIES = (
     "[dry] Context check: ~{tokens:,} tokens (~{pct}% of your {ref:,}-token"
     " working budget). Largest tool results so far: {hogs}. Attention quality"
@@ -35,15 +37,43 @@ ADVISORIES = (
     " files (cmd > /tmp/out.txt && tail -20 /tmp/out.txt).",
     "[dry] Context check: ~{tokens:,} tokens (~{pct}% of {ref:,}). You are in"
     " the degradation zone. Finish the current subtask, update the ledger"
-    " (.claude/dry/ledger.md: decisions, files, gotchas, next), then treat"
-    " this as a boundary: recommend the user run /compact with ledger-derived"
-    " instructions, or /clear (dry rehydrates automatically). Avoid opening"
-    " new exploration before checkpointing.",
-    "[dry] Context check: ~{tokens:,} tokens (~{pct}% of {ref:,}) — near the"
-    " compaction point. Checkpoint NOW: update .claude/dry/ledger.md first,"
-    " keep further tool output minimal, and in your next user-facing message"
-    " propose compaction with specific keep-instructions from the ledger."
-    " A full pre-compact transcript snapshot is saved automatically.",
+    " (.claude/dry/ledger.md: decisions, files, gotchas, next), and avoid"
+    " opening new exploration before checkpointing. When you next report to"
+    " the user, note in one line that this is a good boundary for /compact"
+    " (with ledger-derived keep-instructions) or /clear — dry rehydrates from"
+    " the ledger either way.",
+    "[dry] Context check: ~{tokens:,} tokens (~{pct}% of {ref:,}) — near or"
+    " past the end of your working budget. Checkpoint now: update .claude/dry/ledger.md"
+    " first and keep further tool output minimal. In your next user-facing"
+    " message, suggest /compact with specific keep-instructions from the"
+    " ledger, in one line. A full pre-compact transcript snapshot is saved"
+    " automatically.",
+)
+
+# Gated runs (DRY_GATE=1): the agent owns compaction and releases it itself
+# at a boundary, but only once the harness has actually attempted one (the
+# pending notice below). Never ask the user; never narrate context state.
+GATE_ADVISORIES = (
+    "[dry] Context check: ~{tokens:,} tokens (~{pct}% of your {ref:,}-token"
+    " working budget). Largest tool results so far: {hogs}. Attention quality"
+    " degrades well before hard limits. Consider now: (1) update the task"
+    " ledger — dry:context-ledger skill, .claude/dry/ledger.md; (2) route heavy"
+    " reads/searches through subagents; (3) redirect long command output to"
+    " files (cmd > /tmp/out.txt && tail -20 /tmp/out.txt). Gated run: you"
+    " will compact yourself later — nothing to raise with the user.",
+    "[dry] Context check: ~{tokens:,} tokens (~{pct}% of {ref:,}). Gated run:"
+    " compaction is yours to take, not the user's — do not propose /compact"
+    " or /clear and do not report context state. Do now: finish the current"
+    " subtask before opening new exploration, and bring .claude/dry/ledger.md"
+    " current (decisions with whys, files, gotchas, next). Compaction becomes"
+    " available only when a [dry] pending notice arrives; until then, keep"
+    " working.",
+    "[dry] Context check: ~{tokens:,} tokens (~{pct}% of {ref:,}). You are near"
+    " or past your working budget — the minimum at which a compaction pays off,"
+    " not a deadline. Keep .claude/dry/ledger.md current and tool output lean, and"
+    " carry on. When a [dry] pending notice arrives, release the gate at your"
+    " next clean boundary (touch .claude/dry/compact-ok). Nothing to tell the"
+    " user.",
 )
 
 
@@ -98,8 +128,9 @@ def compute_band(pct: float, bands: list) -> int:
     return band
 
 
-def build_advisory(band: int, tokens: int, ref: int, top: list) -> str:
-    template = ADVISORIES[min(band, len(ADVISORIES) - 1)]
+def build_advisory(band: int, tokens: int, ref: int, top: list, gated: bool = False) -> str:
+    templates = GATE_ADVISORIES if gated else ADVISORIES
+    template = templates[min(band, len(templates) - 1)]
     text = template.format(
         tokens=tokens,
         pct=round(100 * tokens / ref),
@@ -110,26 +141,50 @@ def build_advisory(band: int, tokens: int, ref: int, top: list) -> str:
 
 
 PENDING_NOTICE = (
-    "[dry] A gated auto-compact is pending — dry_gate deferred it for you."
-    " Finish the current step, bring .claude/dry/ledger.md current, then"
-    " release it by running: touch .claude/dry/compact-ok — compaction"
-    " proceeds at that boundary. (A failsafe releases automatically near the"
+    "[dry] A gated auto-compact is pending: the harness asked to compact and"
+    " dry_gate deferred it for you, so compaction is now available. It waits"
+    " until you release it — no rush, and nothing to ask or tell the user."
+    " At your next clean boundary (not mid-subtask): bring the ledger"
+    " ({ledger}) current, then run: touch {flag} — compaction proceeds on the"
+    " next attempt and dry rehydrates you from the ledger. Until then, keep"
+    " working. (Failsafe: compaction is forced only near the model's real"
     " window limit.)"
 )
 
+PENDING_REMINDER = (
+    "[dry] Reminder: a gated auto-compact has been pending for ~{mins} min."
+    " It keeps waiting for you. Whenever you reach a clean boundary, bring"
+    " {ledger} current and run: touch {flag}. Nothing to tell the user."
+)
 
-def pending_notice(cwd: str, watch: dict) -> str | None:
-    """One notice per gate episode: keyed on the pending marker's mtime."""
-    marker = _common.project_dry_dir(cwd) / "compact-pending"
+
+def pending_notice(cwd: str, watch: dict, cfg: dict) -> str | None:
+    """One notice per gate episode (keyed on the pending marker's mtime),
+    then a reminder every gate_remind_minutes while it stays pending."""
+    dry_dir = _common.project_dry_dir(cwd)
+    marker = dry_dir / "compact-pending"
     try:
         mtime = int(marker.stat().st_mtime)
     except OSError:
         watch.pop("pending_seen", None)
+        watch.pop("pending_reminded", None)
         return None
-    if watch.get("pending_seen") == mtime:
+    now = _common.wall()
+    paths = {"ledger": str(dry_dir / "ledger.md"), "flag": str(dry_dir / "compact-ok")}
+    if watch.get("pending_seen") != mtime:
+        watch["pending_seen"] = mtime
+        watch["pending_reminded"] = now
+        return _common.cap_text(PENDING_NOTICE.format(**paths), ADVISORY_MAX)
+    remind = cfg.get("gate_remind_minutes")
+    last = watch.get("pending_reminded")
+    if not isinstance(last, (int, float)):
+        watch["pending_reminded"] = now
         return None
-    watch["pending_seen"] = mtime
-    return PENDING_NOTICE
+    if isinstance(remind, (int, float)) and remind > 0 and now - last >= remind * 60:
+        watch["pending_reminded"] = now
+        mins = max(1, round((now - mtime) / 60))
+        return _common.cap_text(PENDING_REMINDER.format(mins=mins, **paths), ADVISORY_MAX)
+    return None
 
 
 def full_check(data: dict, cfg: dict, watch: dict) -> str | None:
@@ -147,7 +202,8 @@ def full_check(data: dict, cfg: dict, watch: dict) -> str | None:
     last_band = watch["last_band"]
     watch["last_band"] = band
     if band > last_band:
-        return build_advisory(band, tokens, int(ref), watch["top"])
+        gated = _common.gate_enabled(cfg)
+        return build_advisory(band, tokens, int(ref), watch["top"], gated)
     return None
 
 
@@ -159,6 +215,11 @@ def main() -> None:
     event = data.get("hook_event_name")
     if event not in ("UserPromptSubmit", "PostToolUse"):
         return
+    if data.get("agent_id") or data.get("agent_type"):
+        # Subagent tool call: the payload's transcript is the PARENT's, so any
+        # advisory would describe the parent's context and the pending notice
+        # would invite the subagent to release the parent's gate. Stay silent.
+        return
     session_id = str(data.get("session_id") or "")
     if not session_id:
         return
@@ -166,7 +227,7 @@ def main() -> None:
     watch = watch_state(state)
     # The gate's pending marker outranks throttling: the agent must learn
     # promptly that a deferred compaction is waiting on it.
-    notice = pending_notice(data["cwd"], watch)
+    notice = pending_notice(data["cwd"], watch, cfg)
 
     text = None
     if event == "PostToolUse":

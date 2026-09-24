@@ -159,14 +159,14 @@ def test_downward_crossing_resets_silently_then_refires(tmp_path):
 def test_jump_straight_to_highest_band(tmp_path):
     cwd, transcript = setup_session(tmp_path, 180_000)  # 90% -> band 2
     text = parse_output(run_hook(prompt_payload(cwd, transcript, "w4"), tmp_path))
-    assert "near the compaction point" in text
+    assert "near or past the end of your working budget" in text
     assert "~180,000 tokens" in text
     assert read_state(tmp_path, "w4")["watch"]["last_band"] == 2
 
 
 def test_escalation_texts_and_lengths(tmp_path):
     cwd, transcript = setup_session(tmp_path, 120_000)
-    markers = ("working budget", "degradation zone", "near the compaction point")
+    markers = ("working budget", "degradation zone", "near or past the end of your working budget")
     for tokens, marker in zip((120_000, 150_000, 180_000), markers):
         write_transcript(transcript, tokens)
         text = parse_output(run_hook(prompt_payload(cwd, transcript, "w5"), tmp_path))
@@ -310,3 +310,35 @@ def test_state_file_permissions(tmp_path):
     assert state_path.is_file()
     assert state_path.stat().st_mode & 0o777 == 0o600
     assert state_path.parent.stat().st_mode & 0o777 == 0o700
+
+
+# ------------------------------------------------------------ gate-mode wording
+
+def test_gated_run_advisories_never_route_compaction_via_user(tmp_path):
+    cwd, transcript = setup_session(tmp_path, 150_000)  # 75% -> band 1
+    gate = {"DRY_GATE": "1"}
+    text = parse_output(run_hook(prompt_payload(cwd, transcript, "g1"), tmp_path, gate))
+    assert "Gated run" in text
+    assert "do not propose /compact" in text
+    assert "recommend" not in text and "compaction point" not in text
+    write_transcript(transcript, 180_000)  # 90% -> band 2
+    text = parse_output(run_hook(prompt_payload(cwd, transcript, "g1"), tmp_path, gate))
+    assert "minimum at which a compaction pays off" in text
+    assert "Nothing to tell the user" in text
+    assert "propose" not in text and "recommend" not in text
+    assert len(text) < 1000
+
+
+def test_gated_run_first_band_keeps_hygiene_menu(tmp_path):
+    cwd, transcript = setup_session(tmp_path, 120_000)
+    text = parse_output(run_hook(prompt_payload(cwd, transcript, "g2"), tmp_path, {"DRY_GATE": "1"}))
+    assert "working budget" in text and "subagents" in text
+    assert "nothing to raise with the user" in text
+
+
+def test_interactive_run_advisories_keep_user_suggestion(tmp_path):
+    cwd, transcript = setup_session(tmp_path, 150_000)
+    text = parse_output(run_hook(prompt_payload(cwd, transcript, "i1"), tmp_path))
+    assert "Gated run" not in text
+    assert "/compact" in text and "one line" in text
+    assert "compaction point" not in text

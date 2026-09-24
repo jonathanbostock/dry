@@ -197,3 +197,38 @@ def test_ledger_without_goal_and_empty_state(tmp_path):
     assert "2 lines" in out
     assert "none tracked yet" in out  # sid known, no watch state recorded
     assert "band: ok" in out
+
+
+# ------------------------------------------------------------ mode awareness
+
+def _gated_project(tmp_path: Path, pending: bool) -> Path:
+    cwd = tmp_path / "proj"
+    (cwd / ".claude" / "dry").mkdir(parents=True)
+    if pending:
+        (cwd / ".claude" / "dry" / "compact-pending").write_text("pending\n")
+    write_transcript(project_transcripts_dir(tmp_path, cwd) / "sess.jsonl", 150_000)
+    return cwd
+
+
+def test_gated_mode_pending_action(tmp_path):
+    cwd = _gated_project(tmp_path, pending=True)
+    out = run_status(["--cwd", str(cwd)], tmp_path, {"DRY_GATE": "1"}).stdout.decode()
+    assert "mode:      gated self-compaction" in out
+    assert "gate:      auto-compact pending for" in out
+    assert "release it — touch /" in out and "/.claude/dry/compact-ok" in out  # absolute path
+    assert "/compact boundary" not in out  # never routes compaction via the user
+
+
+def test_gated_mode_nothing_pending_action(tmp_path):
+    cwd = _gated_project(tmp_path, pending=False)
+    out = run_status(["--cwd", str(cwd)], tmp_path, {"DRY_GATE": "1"}).stdout.decode()
+    assert "gate:      on — nothing pending yet" in out
+    assert "do not propose /compact or /clear to the user" in out
+
+
+def test_interactive_mode_lines(tmp_path):
+    cwd = _gated_project(tmp_path, pending=False)
+    out = run_status(["--cwd", str(cwd)], tmp_path).stdout.decode()
+    assert "mode:      interactive" in out
+    assert "gate:      off" in out
+    assert "/compact boundary" in out

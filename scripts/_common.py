@@ -42,6 +42,9 @@ DEFAULTS = {
     "gate_enabled": False,
     "gate_flag_max_age_minutes": 60,
     "gate_failsafe_fraction": 0.9,
+    "gate_remind_minutes": 30,
+    "gate_max_pending_minutes": 90,
+    "gate_snapshot_min_interval_seconds": 600,
     "disable": False,
     "disable_watch": False,
     "disable_guard": False,
@@ -102,8 +105,19 @@ def state_dir(session_id: str) -> Path:
     return d
 
 
+def project_root(cwd: str) -> str:
+    """The directory the session started in (CLAUDE_PROJECT_DIR, which Claude
+    Code exports to hooks), else cwd. Hook `cwd` follows the agent's shell
+    `cd`, so anchoring here keeps the ledger, snapshots and gate markers in
+    one place even when the agent wanders into subdirectories or worktrees."""
+    env = os.environ.get("CLAUDE_PROJECT_DIR", "").strip()
+    if env and os.path.isabs(env) and os.path.isdir(env):
+        return env
+    return cwd
+
+
 def project_dry_dir(cwd: str, create: bool = False) -> Path:
-    d = Path(cwd) / ".claude" / "dry"
+    d = Path(project_root(cwd)) / ".claude" / "dry"
     if create:
         d.mkdir(mode=0o700, parents=True, exist_ok=True)
     return d
@@ -151,6 +165,14 @@ def load_config(cwd: str) -> dict:
         if raw is not None:
             cfg[key] = _coerce(default, raw)
     return cfg
+
+
+def gate_enabled(cfg: dict) -> bool:
+    """True when the self-compaction gate is on: config `gate_enabled`
+    (or env DRY_GATE_ENABLED via load_config) or the DRY_GATE launch flag."""
+    if cfg.get("gate_enabled"):
+        return True
+    return os.environ.get("DRY_GATE", "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def atomic_write(path: Path, data: str) -> None:

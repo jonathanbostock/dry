@@ -5,13 +5,18 @@ Wired to BOTH PreCompact and PostCompact (see hooks/hooks.json); branches on
 hook_event_name.
 
   PreCompact  — stream-gzip the full transcript to
-                <cwd>/.claude/dry/snapshots/<utc>-<sid8>-<trigger>.jsonl.gz,
-                prune old snapshots, and on trigger=="auto" append a warning
-                line to the ledger (the post-compact agent sees it via
-                dry_rehydrate).
-  PostCompact — save compact_summary verbatim to
-                snapshots/<utc>-<sid8>-summary-<trigger>.md as an audit trail
-                of what native compaction actually kept; prune old summaries.
+                <cwd>/.claude/dry/snapshots/<utc>-<sid8>-<trigger>.jsonl.gz
+                and prune old snapshots. Nothing else: in gated runs this
+                event also fires on every *blocked* attempt, so it must not
+                write anything that reads as "a compaction happened".
+  PostCompact — a compaction actually happened. Save compact_summary
+                verbatim to snapshots/<utc>-<sid8>-summary-<trigger>.md as an
+                audit trail, prune old summaries, and on trigger=="auto"
+                append ONE ledger line (the post-compact agent sees it via
+                dry_rehydrate): a calm "released at a boundary" note when the
+                gate's compact-released marker says the agent released it, a
+                "forced by the failsafe" warning when the marker says failsafe,
+                otherwise the plain "auto-compact fired mid-task" warning.
 
 Side effects only: never writes stdout, never blocks compaction, always
 exits 0 (fail_open).
@@ -32,6 +37,7 @@ try:
     from _common import (
         atomic_write,
         fail_open,
+        gate_enabled,
         load_config,
         log_debug,
         now_stamp,
@@ -82,16 +88,65 @@ def snapshot_transcript(transcript_path: str, dest: Path) -> bool:
         return False
 
 
-def append_ledger_warning(dry_dir: Path, cwd: str, snapshot: Path) -> None:
-    try:
-        rel = os.path.relpath(snapshot, cwd)
-    except ValueError:
-        rel = str(snapshot)
+RELEASED_MARKER_MAX_AGE_SECONDS = 120  # PreCompact -> PostCompact is seconds apart
+
+
+def append_ledger_line(dry_dir: Path, entry: str) -> None:
     ledger = dry_dir / "ledger.md"
     header = "" if ledger.exists() else "# dry ledger\n\n"
-    entry = f"\n- ⚠ {utc_iso()}: auto-compact fired mid-task; pre-compact snapshot: {rel}\n"
     with open(ledger, "a", encoding="utf-8") as f:
-        f.write(header + entry)
+        f.write(header + "\n" + entry + "\n")
+
+
+RELEASE_KINDS = ("flag", "failsafe", "timeout", "blind")
+
+
+def consume_released_marker(dry_dir: Path) -> tuple[str, str] | None:
+    """Return (kind, detail) from a fresh dry_gate marker, removing it."""
+    marker = dry_dir / "compact-released"
+    try:
+        age = time.time() - marker.stat().st_mtime
+        parts = marker.read_text(encoding="utf-8").split()
+    except OSError:
+        return None
+    marker.unlink(missing_ok=True)
+    if age > RELEASED_MARKER_MAX_AGE_SECONDS or not parts or parts[0] not in RELEASE_KINDS:
+        return None
+    return parts[0], (parts[1] if len(parts) > 1 else "")
+
+
+def newest_snapshot(snapdir: Path) -> Path | None:
+    if not snapdir.is_dir():
+        return None
+    snaps = [p for p in snapdir.glob("*.jsonl.gz") if p.is_file()]
+    return max(snaps, key=lambda p: p.stat().st_mtime) if snaps else None
+
+
+def ledger_note_after_auto_compact(dry_dir: Path, cwd: str) -> None:
+    """One line so the rehydrated agent knows what kind of reset just happened."""
+    released = consume_released_marker(dry_dir)
+    kind, detail = released if released else ("", "")
+    tail = ""
+    snap = newest_snapshot(dry_dir / "snapshots")
+    if snap is not None:
+        try:
+            rel = os.path.relpath(snap, cwd)
+        except ValueError:
+            rel = str(snap)
+        tail = f"; pre-compact snapshot: {rel}"
+    stamp = utc_iso()
+    if kind == "flag":
+        entry = f"- ✓ {stamp}: compaction released at a boundary (gated run){tail}"
+    elif kind == "failsafe":
+        entry = f"- ⚠ {stamp}: auto-compact forced by the gate's failsafe (never released){tail}"
+    elif kind == "timeout":
+        mins = f" {detail} min" if detail else ""
+        entry = f"- ⚠ {stamp}: compaction taken automatically after the gate had been pending{mins} without release{tail}"
+    elif kind == "blind":
+        entry = f"- ℹ {stamp}: auto-compact allowed (dry could not read the context size){tail}"
+    else:
+        entry = f"- ⚠ {stamp}: auto-compact fired mid-task{tail}"
+    append_ledger_line(dry_dir, entry)
 
 
 def handle_pre_compact(data: dict, cfg: dict) -> None:
@@ -104,29 +159,34 @@ def handle_pre_compact(data: dict, cfg: dict) -> None:
         return
     snapdir = dry_dir / "snapshots"
     snapdir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    # Gated runs retry PreCompact every turn while blocked; don't re-gzip a
-    # large transcript on each attempt.
+    # Gated runs retry PreCompact every ~80 s while blocked; don't re-gzip a
+    # large transcript on each attempt (the ledger, not the snapshot, is the
+    # recovery anchor — a snapshot up to 10 min old is plenty).
+    interval = (
+        cfg["gate_snapshot_min_interval_seconds"] if gate_enabled(cfg)
+        else cfg["snapshot_min_interval_seconds"]
+    )
     newest = max((p.stat().st_mtime for p in snapdir.glob("*.jsonl.gz")), default=0.0)
-    if time.time() - newest < cfg["snapshot_min_interval_seconds"]:
+    if time.time() - newest < interval:
         return
     dest = snapdir / f"{now_stamp()}-{sid8(data.get('session_id'))}-{safe_name(trigger)}.jsonl.gz"
     if not snapshot_transcript(transcript_path, dest):
         return
     prune(snapdir, "*.jsonl.gz", cfg["snapshots_keep"])
-    if trigger == "auto":
-        append_ledger_warning(dry_dir, cwd, dest)
 
 
 def handle_post_compact(data: dict, cfg: dict) -> None:
-    summary = data.get("compact_summary")
-    if not isinstance(summary, str) or not summary:
-        return
     cwd = data["cwd"]
     trigger = data.get("trigger") or "unknown"
-    snapdir = project_dry_dir(cwd, create=True) / "snapshots"
-    dest = snapdir / f"{now_stamp()}-{sid8(data.get('session_id'))}-summary-{safe_name(trigger)}.md"
-    atomic_write(dest, f"saved: {utc_iso()}\ntrigger: {trigger}\n\n{summary}")
-    prune(snapdir, "*.md", cfg["snapshots_keep"])
+    dry_dir = project_dry_dir(cwd, create=True)
+    summary = data.get("compact_summary")
+    if isinstance(summary, str) and summary:
+        snapdir = dry_dir / "snapshots"
+        dest = snapdir / f"{now_stamp()}-{sid8(data.get('session_id'))}-summary-{safe_name(trigger)}.md"
+        atomic_write(dest, f"saved: {utc_iso()}\ntrigger: {trigger}\n\n{summary}")
+        prune(snapdir, "*.md", cfg["snapshots_keep"])
+    if trigger == "auto":
+        ledger_note_after_auto_compact(dry_dir, cwd)
 
 
 def main() -> None:

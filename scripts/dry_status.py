@@ -27,13 +27,32 @@ LEDGER_READ_MAX = 64 * 1024
 
 BAND_NAMES = ("advisory", "degradation", "critical")
 
+# Interactive runs: the user runs /compact or /clear; the agent may suggest.
 ACTIONS = (
     "update the ledger (.claude/dry/ledger.md); route heavy reads/searches"
     " through subagents; redirect long command output to files.",
-    "finish the current subtask, update the ledger, then recommend /compact"
-    " with ledger-derived instructions (or /clear) at this boundary.",
-    "checkpoint NOW — update the ledger, keep tool output minimal, and"
-    " propose /compact with keep-instructions from the ledger.",
+    "finish the current subtask, update the ledger, then note to the user in"
+    " one line that this is a good /compact boundary (ledger-derived keep"
+    " instructions) — or /clear; dry rehydrates either way.",
+    "checkpoint NOW — update the ledger, keep tool output minimal, and suggest"
+    " /compact with keep-instructions from the ledger in your next message.",
+)
+
+# Gated runs: the agent owns compaction; never route it through the user.
+GATE_ACTIONS = (
+    "update the ledger (.claude/dry/ledger.md); route heavy reads/searches"
+    " through subagents; redirect long command output to files. Nothing to"
+    " raise with the user.",
+    "finish the current subtask and bring the ledger current, then keep"
+    " working. Compaction becomes available when a [dry] pending notice"
+    " arrives — do not propose /compact or /clear to the user.",
+    "keep the ledger current and tool output lean; carry on. Release the gate"
+    " at your next clean boundary once a compaction is pending.",
+)
+
+GATE_PENDING_ACTION = (
+    "a gated auto-compact is pending: at your next clean boundary bring the"
+    " ledger current, then release it — touch {flag}. Nothing to ask the user."
 )
 
 
@@ -68,12 +87,34 @@ def band_name(band: int) -> str:
     return BAND_NAMES[min(band, len(BAND_NAMES) - 1)]
 
 
-def action_for(band: int | None) -> str:
+def action_for(band: int | None, gated: bool = False, pending: bool = False,
+               flag: str = ".claude/dry/compact-ok") -> str:
+    if gated and pending:
+        return GATE_PENDING_ACTION.format(flag=flag)
     if band is None:
         return "unknown"
     if band < 0:
         return "none — context healthy; keep the ledger current at task boundaries."
-    return ACTIONS[min(band, len(ACTIONS) - 1)]
+    actions = GATE_ACTIONS if gated else ACTIONS
+    return actions[min(band, len(actions) - 1)]
+
+
+def mode_line(gated: bool) -> str:
+    if gated:
+        return ("gated self-compaction (DRY_GATE) — you release compaction"
+                " yourself at a boundary; never ask the user to compact")
+    return "interactive — the user runs /compact or /clear; you may suggest a boundary"
+
+
+def gate_line(dry_dir: Path, gated: bool) -> str:
+    if not gated:
+        return "off"
+    marker = dry_dir / "compact-pending"
+    if marker.is_file():
+        age = humanize_age(_common.wall() - marker.stat().st_mtime)
+        return (f"auto-compact pending for {age} — release at a clean boundary:"
+                f" touch {dry_dir / 'compact-ok'}")
+    return "on — nothing pending yet (compaction not available until the harness attempts one)"
 
 
 def humanize_age(seconds: float) -> str:
@@ -165,13 +206,18 @@ def main() -> None:
     except Exception:
         ctx, band = "unknown", None
 
+    gated = _common.gate_enabled(cfg)
+    pending = (dry_dir / "compact-pending").is_file()
+
     sections = (
         ("context:", lambda: ctx),
+        ("mode:", lambda: mode_line(gated)),
+        ("gate:", lambda: gate_line(dry_dir, gated)),
         ("top hogs:", lambda: hogs_line(sid)),
         ("ledger:", lambda: ledger_line(dry_dir / "ledger.md")),
         ("snapshots:", lambda: snapshots_line(dry_dir / "snapshots")),
         ("archive:", lambda: archive_line(dry_dir / "archive")),
-        ("action:", lambda: action_for(band)),
+        ("action:", lambda: action_for(band, gated, pending, str(dry_dir / "compact-ok"))),
     )
     out = [f"dry status — {cwd}"]
     for label, fn in sections:

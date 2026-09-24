@@ -3,8 +3,9 @@
 # window (the --autocompact minimum) and asserts every dry compaction hook
 # fired with the field names we coded against. Costs ~130k input tokens.
 #
-#   PreCompact(auto)  -> snapshots/<stamp>-<sid8>-auto.jsonl.gz + ledger ⚠ line
-#   PostCompact(auto) -> snapshots/<stamp>-<sid8>-summary-auto.md
+#   PreCompact(auto)  -> snapshots/<stamp>-<sid8>-auto.jsonl.gz
+#   PostCompact(auto) -> snapshots/<stamp>-<sid8>-summary-auto.md + ledger ⚠ line
+#                        (moved here in v0.2.0: PreCompact also fires on gate-blocked attempts)
 #   SessionStart(compact) -> "[dry] Context was just compacted" injection
 #
 # Usage: bash tests/smoke_compact.sh   (exit 0 = all checks passed)

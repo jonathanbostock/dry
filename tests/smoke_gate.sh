@@ -48,8 +48,12 @@ for i in range(1, 10):
 EOF
 
 PROMPT="Read these files one at a time, each with a single Read call, in order: doc1.txt through doc9.txt in $SANDBOX. After each, state just its number. IMPORTANT: if at any point a [dry] message tells you a gated auto-compact is pending, immediately follow its instruction (run the touch command it gives, one Bash call) and then continue with the remaining files. Finish by replying: ALLDONE."
+# The installed dry plugin (if any) must not double-run inside the sandbox:
+# its guard would shrink the Read results this test relies on to inflate
+# context, and its own watch/checkpoint copies would race ours.
 OUT="$(cd "$SANDBOX" && timeout 540 claude -p "$PROMPT" \
-  --model "$MODEL" --autocompact 100000 --output-format json 2>&1)"
+  --model "$MODEL" --autocompact 100000 --output-format json \
+  --settings '{"enabledPlugins":{"dry@dry":false}}' 2>&1)"
 LAST="$(printf '%s\n' "$OUT" | awk '/^\{/{l=$0} END{print l}')"
 SID="$(printf '%s' "$LAST" | jq -r '.session_id // empty' 2>/dev/null)"
 check "gate session ran" "$( [ -n "$SID" ] && echo true || echo false )"
@@ -65,7 +69,7 @@ check "gate invoked at least twice (block then retry/release)" \
 check "at least one attempt was blocked (invocations > compactions)" \
   "$( [ "$INVOCATIONS" -gt "$BOUNDARIES" ] && echo true || echo false )"
 check "pending notice delivered to agent" \
-  "$( grep -rq 'gated auto-compact is pending' "$TD" 2>/dev/null && echo true || echo false )"
+  "$( grep -rq 'deferred it for you' "$TD" 2>/dev/null && echo true || echo false )"  # phrase unique to the hook notice, not the prompt
 check "agent released the gate (touch compact-ok in transcript)" \
   "$( grep -rq 'touch .claude/dry/compact-ok\|touch \.claude/dry/compact-ok\|compact-ok' "$TD" 2>/dev/null && echo true || echo false )"
 check "compaction proceeded after release (boundary present)" \

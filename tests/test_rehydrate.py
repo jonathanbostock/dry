@@ -219,3 +219,50 @@ def test_malformed_stdin_exits_zero(tmp_path):
     for raw in (b"", b"{", b'"str"', b'{"source": "compact"}'):
         proc = run_hook(tmp_path, raw=raw)
         assert proc.returncode == 0 and proc.stdout == b""
+
+
+# ------------------------------------------ reset kind, pending clear, pruning
+
+def _dry(proj: Path) -> Path:
+    d = proj / ".claude" / "dry"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def test_compact_announces_release_kind_without_consuming_marker(tmp_path):
+    proj = make_project(tmp_path)
+    write_ledger(proj)
+    dry = _dry(proj)
+    (dry / "compact-released").write_text("flag\n")
+    (dry / "compact-pending").write_text("pending\n")
+    text = context_of(run_hook(tmp_path, payload(proj, "compact")))
+    assert "your own boundary release" in text
+    assert (dry / "compact-released").exists()  # PostCompact consumes it, not us
+    assert not (dry / "compact-pending").exists()  # the pending episode is over
+
+
+def test_compact_announces_failsafe_and_timeout(tmp_path):
+    proj = make_project(tmp_path)
+    write_ledger(proj)
+    dry = _dry(proj)
+    (dry / "compact-released").write_text("failsafe\n")
+    assert "forced by the gate's failsafe" in context_of(run_hook(tmp_path, payload(proj, "compact")))
+    (dry / "compact-released").write_text("timeout 95\n")
+    assert "pending ~95 min without release" in context_of(run_hook(tmp_path, payload(proj, "compact")))
+
+
+def test_compact_prunes_old_bookkeeping_lines(tmp_path):
+    proj = make_project(tmp_path)
+    noise = "".join(
+        f"\n- ⚠ 2026-08-24T18:{i:02d}:00+00:00: auto-compact fired mid-task; pre-compact snapshot: s{i}.gz\n"
+        for i in range(40)
+    )
+    write_ledger(
+        proj,
+        "# dry ledger\n" + noise + "\n## Goal\nShip it\n\n## Now\nstep 3\n\n"
+        "- ✓ 2026-09-24T12:00:00+00:00: compaction released at a boundary (gated run)\n",
+    )
+    text = context_of(run_hook(tmp_path, payload(proj, "compact")))
+    assert "auto-compact fired mid-task" not in text
+    assert "compaction released at a boundary" in text
+    assert "## Goal" in text and "## Now" in text

@@ -44,6 +44,7 @@ def usage_record(tokens: int, extra: dict | None = None) -> str:
 
 def run_script(script: str, payload: dict, tmp_path: Path, env_extra: dict | None = None):
     env = dict(os.environ)
+    env.pop("CLAUDE_PROJECT_DIR", None)
     env["TMPDIR"] = str(tmp_path / "tmp")
     (tmp_path / "tmp").mkdir(exist_ok=True)
     env.update(env_extra or {})

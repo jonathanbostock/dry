@@ -12,6 +12,7 @@ import os
 import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "dry_checkpoint.py"
@@ -97,28 +98,90 @@ def test_precompact_manual_snapshot(tmp_path):
     assert not (proj / ".claude" / "dry" / "ledger.md").exists()
 
 
-def test_precompact_auto_appends_ledger(tmp_path):
+def test_precompact_auto_leaves_ledger_alone(tmp_path):
+    """PreCompact fires on every gate-blocked attempt too, so it must not
+    write "a compaction happened" into the ledger (regression: 198 ⚠ lines
+    in one gated project's ledger)."""
     proj = make_project(tmp_path)
     transcript = make_transcript(tmp_path)
     proc = run_hook(tmp_path, pre_compact_payload(proj, transcript, trigger="auto"))
     assert proc.returncode == 0 and proc.stdout == b""
-    ledger = proj / ".claude" / "dry" / "ledger.md"
-    content = ledger.read_text(encoding="utf-8")
+    assert len(list(snapdir(proj).glob("*-auto.jsonl.gz"))) == 1
+    assert not (proj / ".claude" / "dry" / "ledger.md").exists()
+
+
+def _ledger(proj: Path) -> Path:
+    return proj / ".claude" / "dry" / "ledger.md"
+
+
+def test_postcompact_auto_appends_mid_task_warning(tmp_path):
+    proj = make_project(tmp_path)
+    transcript = make_transcript(tmp_path)
+    run_hook(tmp_path, pre_compact_payload(proj, transcript, trigger="auto"))
+    proc = run_hook(tmp_path, post_compact_payload(proj, trigger="auto"))
+    assert proc.returncode == 0 and proc.stdout == b""
+    content = _ledger(proj).read_text(encoding="utf-8")
     assert content.startswith("# dry ledger\n\n")
     assert "⚠" in content and "auto-compact fired mid-task" in content
     snaps = list(snapdir(proj).glob("*-auto.jsonl.gz"))
-    assert len(snaps) == 1
-    assert os.path.relpath(snaps[0], proj) in content
-    # a second auto compaction appends without duplicating the header
-    # (interval override: back-to-back snapshots are throttled by default)
-    run_hook(
-        tmp_path,
-        pre_compact_payload(proj, transcript, trigger="auto"),
-        extra_env={"DRY_SNAPSHOT_MIN_INTERVAL_SECONDS": "0"},
-    )
-    content = ledger.read_text(encoding="utf-8")
+    assert len(snaps) == 1 and os.path.relpath(snaps[0], proj) in content
+    # a second compaction appends without duplicating the header
+    run_hook(tmp_path, post_compact_payload(proj, trigger="auto"))
+    content = _ledger(proj).read_text(encoding="utf-8")
     assert content.count("# dry ledger") == 1
     assert content.count("auto-compact fired mid-task") == 2
+
+
+def test_postcompact_manual_leaves_ledger_alone(tmp_path):
+    proj = make_project(tmp_path)
+    proc = run_hook(tmp_path, post_compact_payload(proj, trigger="manual"))
+    assert proc.returncode == 0 and proc.stdout == b""
+    assert not _ledger(proj).exists()
+
+
+def test_postcompact_released_marker_gives_calm_note(tmp_path):
+    proj = make_project(tmp_path)
+    dry = proj / ".claude" / "dry"
+    dry.mkdir(parents=True)
+    (dry / "compact-released").write_text("flag\n")
+    run_hook(tmp_path, post_compact_payload(proj, trigger="auto"))
+    content = _ledger(proj).read_text(encoding="utf-8")
+    assert "✓" in content and "released at a boundary (gated run)" in content
+    assert "⚠" not in content and "mid-task" not in content
+    assert not (dry / "compact-released").exists()  # consumed
+
+
+def test_postcompact_failsafe_marker_gives_warning(tmp_path):
+    proj = make_project(tmp_path)
+    dry = proj / ".claude" / "dry"
+    dry.mkdir(parents=True)
+    (dry / "compact-released").write_text("failsafe\n")
+    run_hook(tmp_path, post_compact_payload(proj, trigger="auto"))
+    content = _ledger(proj).read_text(encoding="utf-8")
+    assert "⚠" in content and "forced by the gate's failsafe" in content
+    assert not (dry / "compact-released").exists()
+
+
+def test_postcompact_stale_released_marker_ignored(tmp_path):
+    proj = make_project(tmp_path)
+    dry = proj / ".claude" / "dry"
+    dry.mkdir(parents=True)
+    marker = dry / "compact-released"
+    marker.write_text("flag\n")
+    old = marker.stat().st_mtime - 3600
+    os.utime(marker, (old, old))
+    run_hook(tmp_path, post_compact_payload(proj, trigger="auto"))
+    content = _ledger(proj).read_text(encoding="utf-8")
+    assert "auto-compact fired mid-task" in content and "released" not in content
+    assert not marker.exists()  # still consumed so it cannot mislabel a later compaction
+
+
+def test_postcompact_ledger_note_without_summary(tmp_path):
+    proj = make_project(tmp_path)
+    payload = post_compact_payload(proj, trigger="auto", summary="")
+    proc = run_hook(tmp_path, payload)
+    assert proc.returncode == 0 and proc.stdout == b""
+    assert "auto-compact fired mid-task" in _ledger(proj).read_text(encoding="utf-8")
 
 
 def test_prune_keeps_newest(tmp_path):
@@ -252,3 +315,32 @@ def test_cwd_is_a_file_exits_zero(tmp_path):
     payload = pre_compact_payload(blocker, transcript)
     proc = run_hook(tmp_path, payload)
     assert proc.returncode == 0 and proc.stdout == b""
+
+
+def test_postcompact_timeout_and_blind_markers(tmp_path):
+    proj = make_project(tmp_path)
+    dry = proj / ".claude" / "dry"
+    dry.mkdir(parents=True)
+    (dry / "compact-released").write_text("timeout 95\n")
+    run_hook(tmp_path, post_compact_payload(proj, trigger="auto"))
+    content = _ledger(proj).read_text(encoding="utf-8")
+    assert "⚠" in content and "pending 95 min without release" in content
+    (dry / "compact-released").write_text("blind\n")
+    run_hook(tmp_path, post_compact_payload(proj, trigger="auto"))
+    content = _ledger(proj).read_text(encoding="utf-8")
+    assert "ℹ" in content and "could not read the context size" in content
+
+
+def test_precompact_gated_snapshot_interval_is_longer(tmp_path):
+    proj = make_project(tmp_path)
+    transcript = make_transcript(tmp_path)
+    sd = snapdir(proj)
+    sd.mkdir(parents=True)
+    fresh = sd / "20990101T000000Z-old-auto.jsonl.gz"
+    fresh.write_bytes(b"x")
+    old = time.time() - 300  # 5 min: past the 60 s default, inside the 600 s gated interval
+    os.utime(fresh, (old, old))
+    run_hook(tmp_path, pre_compact_payload(proj, transcript, trigger="auto"), extra_env={"DRY_GATE": "1"})
+    assert len(list(sd.glob("*.jsonl.gz"))) == 1  # throttled in gate mode
+    run_hook(tmp_path, pre_compact_payload(proj, transcript, trigger="auto"))
+    assert len(list(sd.glob("*.jsonl.gz"))) == 2  # not throttled without the gate
