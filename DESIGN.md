@@ -79,7 +79,7 @@ Everything Python 3 (≥3.10) stdlib-only, one shared helper module. Every hook 
 - **`PreCompact` (manual|auto):** gzip-copy the transcript to `<cwd>/.claude/dry/snapshots/<utc>-<sid8>-<trigger>.jsonl.gz`; prune to last 10. On **auto** trigger additionally append one line to the ledger: `⚠ auto-compact fired <utc> — snapshot: <path>` (the post-compact agent will see it via rehydration). *v0.2.0 (§11): moved to PostCompact and labelled released/failsafe/mid-task — PreCompact fires on blocked gated attempts too.* Never blocks compaction (blocking an error-recovery auto-compact fails the request — verified).
 - **`PostCompact` (manual|auto):** save `compact_summary` to `snapshots/<utc>-summary.md` — an audit trail of what native compaction actually kept. No injection (event has none; side-effect only).
 - **`SessionStart`:**
-  - matcher `compact`: inject ledger content (cap 6_000 chars, else head + pointer) + fixed preamble: "Compaction just occurred; the native summary may have dropped specifics. The ledger below and snapshot on disk are authoritative. Re-read before continuing."
+  - matcher `compact`: inject ledger content (cap 6_000 chars, else a newest-first digest + marker) + fixed preamble: "Compaction just occurred; the native summary may have dropped specifics. The ledger below and snapshot on disk are authoritative. Re-read before continuing."
   - matcher `clear|resume`: pointer-only (one line): ledger path + its `## Goal` first line + age — *if* the ledger exists and is <7 days old. New tasks shouldn't inherit a stale ledger's full weight; resumed ones get it in one `Read`.
   - matcher `startup`: **not hooked** — CLAUDE.md / auto-memory already own cold starts; don't double-inject.
 

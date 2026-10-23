@@ -131,7 +131,7 @@ def test_rehydrate_bounded_on_huge_ledger(tmp_path):
     assert out.returncode == 0
     body = json.loads(out.stdout.decode())
     ctx = body["hookSpecificOutput"]["additionalContext"]
-    assert len(ctx) < 6_500 and "[dry: ledger truncated" in ctx
+    assert len(ctx) < 6_500 and "[dry: newest-first digest" in ctx
 
 
 def test_import_failure_exits_zero_silently(tmp_path):

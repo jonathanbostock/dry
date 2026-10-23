@@ -31,9 +31,6 @@ Ship the dry plugin
 - smoke test
 """
 
-TRUNCATION_MARKER = "[dry: ledger truncated — Read .claude/dry/ledger.md for the rest]"
-
-
 def run_hook(tmp_path, payload=None, raw=None, extra_env=None):
     env = {
         "PATH": os.environ.get("PATH", ""),
@@ -111,16 +108,100 @@ def test_compact_with_ledger_no_snapshot(tmp_path):
     assert "pre-compact transcript snapshot" not in text
 
 
-def test_compact_long_ledger_capped(tmp_path):
+DIGEST_MARKER_HEAD = "[dry: newest-first digest;"
+
+
+def _inner(text: str) -> str:
+    return text.split("---\n", 1)[1].rsplit("\n---", 1)[0]
+
+
+def test_short_ledger_injected_unchanged(tmp_path):
     proj = make_project(tmp_path)
-    body = "\n".join(f"- decision {i}: keep helper {i} because reasons" for i in range(400))
-    write_ledger(proj, "## Goal\nBig task\n\n" + body + "\nFINAL-UNIQUE-TAIL\n")
+    write_ledger(proj)
+    inner = _inner(context_of(run_hook(tmp_path, payload(proj, "compact"))))
+    assert inner == LEDGER
+    assert "digest" not in inner
+
+
+def test_compact_long_ledger_is_newest_first_digest(tmp_path):
+    proj = make_project(tmp_path)
+    body = "\n".join(
+        f"- 2026-01-01T{i // 60:02d}:{i % 60:02d}Z decision {i}: keep helper {i} because reasons"
+        for i in range(400)
+    )
+    write_ledger(proj, "# dry ledger\n\n## Goal\nBig task\n\n## Log\n" + body + "\n- FINAL-UNIQUE-TAIL newest entry\n")
     text = context_of(run_hook(tmp_path, payload(proj, "compact")))
-    assert TRUNCATION_MARKER in text
-    assert "Big task" in text  # head kept
-    assert "FINAL-UNIQUE-TAIL" not in text  # tail dropped
-    inner = text.split("---\n", 1)[1].rsplit("\n---", 1)[0]
+    assert "newest-first digest" in text.split("---\n", 1)[0]  # the preamble says what this is
+    inner = _inner(text)
     assert len(inner) <= 6000
+    assert DIGEST_MARKER_HEAD in inner and "older ledger items omitted" in inner
+    assert "Big task" in inner  # pinned Goal kept
+    assert "FINAL-UNIQUE-TAIL" in inner  # newest item kept
+    assert inner.index("FINAL-UNIQUE-TAIL") < inner.index("decision 399") < inner.index("decision 398")
+    assert "decision 0:" not in inner  # oldest dropped
+    assert inner.index("## Goal") < inner.index("## Log")
+
+
+def test_digest_item_caps_and_stubs(tmp_path):
+    proj = make_project(tmp_path)
+    items = [f"- item{i:03d} " + "x" * 900 for i in range(60)]
+    items.append("- newest " + "y" * 3000)
+    write_ledger(proj, "## Log\n" + "\n".join(items) + "\n")
+    inner = _inner(context_of(run_hook(tmp_path, payload(proj, "compact"))))
+    lines = [l for l in inner.splitlines() if l.startswith("- ")]
+    assert lines[0].startswith("- newest") and len(lines[0]) == 2000  # 1999 chars + ellipsis
+    assert lines[1].startswith("- item059") and lines[2].startswith("- item058")  # newest first
+    detail = [l for l in lines[1:] if len(l) == 500]
+    assert len(detail) == 6  # 2000 + 6 x 500 = the 5,000-char detail budget
+    stubs = lines[1 + len(detail):]
+    assert stubs and all(len(l) == 110 for l in stubs)
+    assert len(inner) <= 6000
+
+
+def test_digest_pins_goal_and_now_and_groups_by_section(tmp_path):
+    proj = make_project(tmp_path)
+    pad = "\n".join(f"- 2026-02-02T00:00Z older note {i} " + "z" * 200 for i in range(80))
+    write_ledger(
+        proj,
+        "# L\n\n## Goal\nShip X\n\n## Now\ncurrent step Q\n\n## Ancient\n" + pad
+        + "\n\n## Recent\n- 2026-03-03T00:00Z latest thing\n",
+    )
+    inner = _inner(context_of(run_hook(tmp_path, payload(proj, "compact"))))
+    assert inner.startswith("# L\n## Goal\nShip X\n## Now\ncurrent step Q\n## Recent\n- 2026-03-03T00:00Z latest thing\n## Ancient\n")
+    assert inner.index("older note 79") < inner.index("older note 78")
+    assert "older note 0 " not in inner
+    assert "Older sections" not in inner  # every section header was reached
+
+
+def test_digest_lists_sections_it_never_reached(tmp_path):
+    proj = make_project(tmp_path)
+    old = "\n".join(f"- old {i} " + "q" * 300 for i in range(40))
+    new = "\n".join(f"- new {i} " + "r" * 900 for i in range(60))  # the budget runs out inside this section
+    write_ledger(proj, "## First task\n" + old + "\n\n## Second task\n" + new + "\n")
+    inner = _inner(context_of(run_hook(tmp_path, payload(proj, "compact"))))
+    assert "## Second task" in inner and "## First task" not in inner
+    assert "Older sections, items omitted: First task" in inner
+
+
+def test_digest_cap_configurable(tmp_path):
+    proj = make_project(tmp_path)
+    write_ledger(proj, "## Log\n" + "\n".join(f"- entry {i} " + "w" * 100 for i in range(100)) + "\n")
+    (proj / ".claude" / "dry" / "config.json").write_text('{"rehydrate_ledger_chars": 1500}')
+    inner = _inner(context_of(run_hook(tmp_path, payload(proj, "compact"))))
+    assert len(inner) <= 1500 and "entry 99 " in inner and "entry 0 " not in inner
+    env = {"DRY_REHYDRATE_LEDGER_CHARS": "900"}
+    inner = _inner(context_of(run_hook(tmp_path, payload(proj, "compact"), extra_env=env)))
+    assert len(inner) <= 900 and "entry 99 " in inner
+
+
+def test_parse_ledger_items_fences_and_continuations():
+    sys.path.insert(0, str(SCRIPT.parent))
+    import dry_rehydrate as r
+
+    parts = r.parse_ledger("# T\n\n## S\n- one\n  cont\n- two\n```\n- not an item\n```\npara line\nmore\n\n1. three\n")
+    assert parts[0] == ("title", "# T") and parts[1] == ("section", "## S")
+    items = [t for k, t in parts if k == "item"]
+    assert items == ["- one\n  cont", "- two\n```\n- not an item\n```\npara line\nmore", "1. three"]
 
 
 def test_compact_without_ledger_prompts_creation(tmp_path):
