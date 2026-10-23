@@ -47,7 +47,7 @@ Three deterministic legs plus a judgement layer. Every hook wraps its body in a 
 
 - **`PreCompact`** (manual and auto): gzip-copies the full transcript to `<project>/.claude/dry/snapshots/<utc>-<sid8>-<trigger>.jsonl.gz`, pruning to the last 10 and throttled to one per 60 s (gated runs retry blocked attempts every turn). Writes nothing else — in gated runs this event also fires on *blocked* attempts, so it must not record "a compaction happened". Never blocks compaction (blocking an error-recovery auto-compact would fail the request).
 - **`PostCompact`**: saves the native `compact_summary` to `snapshots/<utc>-<sid8>-summary-<trigger>.md` — an audit trail of what compaction actually kept — and, on an *auto* trigger, appends one line to the ledger so the post-compaction agent knows what kind of reset just happened: `- ✓ <utc>: compaction released at a boundary (gated run); pre-compact snapshot: <path>` when the gate's `compact-released` marker says the agent released it, `- ⚠ <utc>: auto-compact forced by the gate's failsafe (never released); …` when the failsafe did, otherwise `- ⚠ <utc>: auto-compact fired mid-task; …`. Side effect only; this event carries no injection channel.
-- **`SessionStart` matcher `compact`**: injects the ledger content (capped at 6,000 chars, else head + truncation marker; dry's own bookkeeping lines pruned to the newest one) behind the fixed preamble: "[dry] Context was just compacted. The native summary above may have dropped specifics. <reset kind, when the gate left a marker: your own boundary release / forced by the failsafe / taken after N min pending / blind> The task ledger below is authoritative (full pre-compact transcript snapshot: `<path>`). Re-read it before continuing." This hook runs *before* PostCompact (measured on five live compactions), so it reads the gate's marker without consuming it and clears any leftover `compact-pending`.
+- **`SessionStart` matcher `compact`**: injects the ledger content (unchanged when it fits 6,000 chars; otherwise a newest-first digest: Goal and Now pinned, then the latest items grouped under their section headers — the newest up to 2,000 chars, the next up to 500 each until 5,000 chars of items, then one-line stubs — closed by a marker counting the older items left out; the caps are the `rehydrate_*` config keys; dry's own bookkeeping lines pruned to the newest one) behind the fixed preamble: "[dry] Context was just compacted. The native summary above may have dropped specifics. <reset kind, when the gate left a marker: your own boundary release / forced by the failsafe / taken after N min pending / blind> The task ledger below is authoritative (full pre-compact transcript snapshot: `<path>`). Re-read it before continuing." This hook runs *before* PostCompact (measured on five live compactions), so it reads the gate's marker without consuming it and clears any leftover `compact-pending`.
 - **`SessionStart` matcher `clear|resume`**: injects a one-line pointer only — ledger path, its `## Goal` first line, and its age — and only if the ledger exists and is under 7 days old. New tasks don't inherit a stale ledger's weight; resumed ones recover it in one `Read`.
 - **`SessionStart` matcher `startup`**: deliberately not hooked — CLAUDE.md and auto-memory own cold starts.
 
@@ -108,6 +108,11 @@ Defaults ← `<project>/.claude/dry/config.json` ← `DRY_*` environment variabl
 | `snapshots_keep` | `DRY_SNAPSHOTS_KEEP` | `10` |
 | `snapshot_min_interval_seconds` | `DRY_SNAPSHOT_MIN_INTERVAL_SECONDS` | `60` |
 | `ledger_pointer_max_age_days` | `DRY_LEDGER_POINTER_MAX_AGE_DAYS` | `7` |
+| `rehydrate_ledger_chars` | `DRY_REHYDRATE_LEDGER_CHARS` | `6000` |
+| `rehydrate_newest_item_chars` | `DRY_REHYDRATE_NEWEST_ITEM_CHARS` | `2000` |
+| `rehydrate_item_chars` | `DRY_REHYDRATE_ITEM_CHARS` | `500` |
+| `rehydrate_detail_chars` | `DRY_REHYDRATE_DETAIL_CHARS` | `5000` |
+| `rehydrate_stub_chars` | `DRY_REHYDRATE_STUB_CHARS` | `110` |
 | `gate_enabled` | `DRY_GATE_ENABLED` (alias: `DRY_GATE=1`) | `false` |
 | `gate_flag_max_age_minutes` | `DRY_GATE_FLAG_MAX_AGE_MINUTES` | `60` |
 | `gate_failsafe_fraction` | `DRY_GATE_FAILSAFE_FRACTION` | `0.9` |
@@ -162,7 +167,7 @@ Two live smokes run real headless sessions in a sandbox project, wiring the hook
 
 - Everything dry writes: dirs `0700`, files `0600`, enforced by umask — explicitly designed against wet's world-readable-state mistake ([buildoak/wet#7](https://github.com/buildoak/wet/issues/7): session logs at `0644`).
 - Everything dry injects into context is plugin-generated text only: token counts, fixed phrases, and paths under dry's own directories. Tool output never round-trips into `additionalContext` — explicitly designed against the [claude-mem unsanitized-injection audit finding](https://github.com/thedotmack/claude-mem/issues/1251).
-- The one exception is deliberate and bounded: post-compaction rehydration injects ledger content (capped at 6,000 chars) and the clear/resume pointer injects the ledger's Goal line (one line). The ledger is agent/user-authored project state, and it is length-capped.
+- The one exception is deliberate and bounded: post-compaction rehydration injects ledger content (capped at 6,000 chars, as a newest-first digest when the file is longer) and the clear/resume pointer injects the ledger's Goal line (one line). The ledger is agent/user-authored project state, and it is length-capped.
 
 ## Limitations and non-features
 

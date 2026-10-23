@@ -3,7 +3,14 @@
 
 SessionStart hook, matcher compact|clear|resume (see hooks/hooks.json).
 
-  source == "compact"       — inject the task ledger (capped at 6k chars)
+  source == "compact"       — inject the task ledger: unchanged when it fits
+                              the cap (6k chars), otherwise a NEWEST-FIRST
+                              digest (Goal/Now pinned, then the latest items
+                              under their section headers: the newest up to
+                              2,000 chars, the next up to 500 each until
+                              5,000 chars of items, then one-line stubs,
+                              closed by a marker counting the older items
+                              left out; caps are rehydrate_* config keys),
                               plus a pointer to the newest pre-compact
                               snapshot and, when dry_gate left a
                               compact-released marker, one sentence on what
@@ -24,6 +31,7 @@ Injected text is plugin-generated phrasing plus content of dry's own files
 from __future__ import annotations
 
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -45,6 +53,14 @@ LEDGER_READ_MAX = 64 * 1024
 LEDGER_CAP = 6_000
 GOAL_CAP = 150
 TRUNCATION_MARKER = "\n[dry: ledger truncated — Read .claude/dry/ledger.md for the rest]"
+NEWEST_ITEM_CAP = 2_000
+ITEM_CAP = 500
+DETAIL_BUDGET = 5_000
+STUB_CAP = 110
+PINNED_SECTIONS = ("goal", "now")  # template sections shown first, in full (capped per item)
+DIGEST_MARKER = ("\n[dry: newest-first digest; {omitted} older ledger items omitted and shown"
+                 " items trimmed — Read .claude/dry/ledger.md for the rest]")
+_ITEM_START = re.compile(r"^([-*+] |\d+[.)] )")
 
 # Bookkeeping lines dry itself appends to the ledger; only the newest one is
 # worth injecting (old runs accumulated hundreds and crowded out Goal/Now).
@@ -116,6 +132,200 @@ def prune_bookkeeping(text: str) -> str:
     return "\n".join(out) + ("\n" if text.endswith("\n") else "")
 
 
+# ------------------------------------------------------------ newest-first digest
+
+def parse_ledger(text: str) -> list[tuple[str, str]]:
+    """Split a ledger into ('title' | 'section' | 'item', text), in document order.
+
+    The first '# ' line is the title and every other heading a section. An item
+    is a bullet ('- ', '* ', '+ ', '1. ') or a paragraph; indented lines, plain
+    lines that follow a bullet and the inside of a ``` fence attach to the
+    current item, and a blank line ends it.
+    """
+    parts: list[tuple[str, str]] = []
+    cur: list[str] = []
+    in_fence = False
+    saw_title = False
+
+    def flush() -> None:
+        nonlocal cur
+        if cur:
+            parts.append(("item", "\n".join(cur)))
+            cur = []
+
+    for line in text.splitlines():
+        stripped = line.strip()
+        if in_fence:
+            cur.append(line)
+            in_fence = not stripped.startswith("```")
+            continue
+        if stripped.startswith("```"):
+            in_fence = True
+            cur.append(line)
+            continue
+        if not stripped:
+            flush()
+            continue
+        if stripped.startswith("#"):
+            flush()
+            if line.startswith("# ") and not saw_title:
+                saw_title = True
+                parts.append(("title", stripped))
+            else:
+                parts.append(("section", stripped))
+            continue
+        if cur and (line[:1].isspace() or not _ITEM_START.match(stripped)):
+            cur.append(line)
+            continue
+        flush()
+        cur = [line]
+    flush()
+    return parts
+
+
+def _trim(text: str, cap: int) -> str:
+    return text if len(text) <= cap else text[: max(1, cap - 1)] + "…"
+
+
+def _stub(text: str, cap: int) -> str:
+    return _trim(" ".join(text.split()), cap)
+
+
+def digest_caps(cfg: dict | None) -> dict:
+    caps = {
+        "ledger": LEDGER_CAP,
+        "newest": NEWEST_ITEM_CAP,
+        "item": ITEM_CAP,
+        "detail": DETAIL_BUDGET,
+        "stub": STUB_CAP,
+    }
+    keys = {
+        "ledger": "rehydrate_ledger_chars",
+        "newest": "rehydrate_newest_item_chars",
+        "item": "rehydrate_item_chars",
+        "detail": "rehydrate_detail_chars",
+        "stub": "rehydrate_stub_chars",
+    }
+    for name, key in keys.items():
+        value = (cfg or {}).get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 40:
+            caps[name] = int(value)
+    return caps
+
+
+def ledger_digest(text: str, caps: dict) -> str:
+    """Newest-first view of a ledger too long to inject whole.
+
+    Title, then the pinned sections (Goal, Now) in document order, then the
+    sections walked last-to-first with their items newest-first under their own
+    header. The newest item is trimmed to caps['newest'] chars, the following
+    ones to caps['item'] until caps['detail'] chars of items are shown, and the
+    rest become one-line stubs of caps['stub'] chars, until the whole text
+    reaches caps['ledger']. Section headers whose items were all left out are
+    listed at the end, before a marker that counts the omitted items.
+    """
+    parts = parse_ledger(text)
+    title = next((t for kind, t in parts if kind == "title"), None)
+    groups: list[tuple[str | None, list[str]]] = []
+    for kind, t in parts:
+        if kind == "title":
+            continue
+        if kind == "section":
+            groups.append((t, []))
+        else:
+            if not groups:
+                groups.append((None, []))
+            groups[-1][1].append(t)
+    total_items = sum(len(items) for _, items in groups)
+
+    def pinned(header: str | None) -> bool:
+        return header is not None and header.lstrip("#").strip().lower() in PINNED_SECTIONS
+
+    out: list[str] = []
+    used = 0
+    # Room for the closing marker, and for the list of section headers the walk
+    # never reaches (the task statements), which is worth more than two stubs.
+    n_walked = sum(1 for h, _ in groups if h is not None and not pinned(h))
+    sections_reserve = 200 if n_walked > 1 else 0
+    limit = caps["ledger"] - len(DIGEST_MARKER.format(omitted=total_items)) - sections_reserve
+
+    def room(piece: str) -> bool:
+        return used + len(piece) + 1 <= limit
+
+    def emit(piece: str) -> bool:
+        nonlocal used
+        if not room(piece):
+            return False
+        out.append(piece)
+        used += len(piece) + 1
+        return True
+
+    shown = 0
+    if title:
+        emit(title)
+    for header, items in groups:
+        if not pinned(header):
+            continue
+        emit(header)
+        for item in items:
+            if emit(_trim(item, caps["item"])):
+                shown += 1
+
+    detail_used = 0
+    n_detail = 0
+    full = True
+    unshown_headers: list[str] = []
+    for header, items in reversed(groups):
+        if pinned(header):
+            continue
+        header_done = header is None
+        for item in reversed(items):
+            if full:
+                cap = caps["newest"] if n_detail == 0 else caps["item"]
+                piece = _trim(item, cap)
+                if detail_used + len(piece) > caps["detail"] and n_detail > 0:
+                    full = False
+            if not full:
+                piece = _stub(item, caps["stub"])
+            header_piece = "" if header_done else header
+            if header_piece and not room(header_piece + "\n" + piece):
+                full = False  # stop everything below; the header goes to the omitted list
+                break
+            if not room(piece):
+                break
+            if header_piece:
+                emit(header_piece)
+                header_done = True
+            emit(piece)
+            shown += 1
+            if full:
+                detail_used += len(piece)
+                n_detail += 1
+        if not header_done and header is not None:
+            unshown_headers.append(header)
+        if used >= limit:
+            break
+    # Headers reached only after the budget ran out, oldest sections last.
+    seen = set(unshown_headers)
+    for header, _ in reversed(groups):
+        if header is not None and not pinned(header) and header not in seen and header not in out:
+            unshown_headers.append(header)
+    limit += sections_reserve
+    if unshown_headers:
+        line = "Older sections, items omitted: " + "; ".join(h.lstrip("#").strip() for h in unshown_headers)
+        emit(_trim(line, max(40, limit - used - 1)))
+    omitted = max(0, total_items - shown)
+    return "\n".join(out) + DIGEST_MARKER.format(omitted=omitted)
+
+
+def ledger_view(text: str, caps: dict) -> str:
+    """The ledger as injected: unchanged when it fits, else the newest-first digest."""
+    text = prune_bookkeeping(text)
+    if len(text) <= caps["ledger"]:
+        return text
+    return ledger_digest(text, caps)
+
+
 def released_note(dry_dir: Path) -> str:
     """Read (never consume — PostCompact does that) dry_gate's release marker."""
     try:
@@ -128,11 +338,15 @@ def released_note(dry_dir: Path) -> str:
     return " " + RESET_NOTES[parts[0]].format(detail=detail)
 
 
-def compact_context(cwd: str, ledger: Path) -> str:
+def compact_context(cwd: str, ledger: Path, cfg: dict | None = None) -> str:
     dry_dir = project_dry_dir(cwd)
     if not ledger.is_file():
         return NO_LEDGER_MSG + released_note(dry_dir)
-    text = cap_text(prune_bookkeeping(read_head(ledger)), LEDGER_CAP, TRUNCATION_MARKER)
+    text = ledger_view(read_head(ledger), digest_caps(cfg))
+    digestnote = ""
+    if DIGEST_MARKER[:28] in text:
+        digestnote = ("; it is longer than the injection cap, so this is a newest-first"
+                      " digest: latest items first, older ones omitted")
     snap = newest_snapshot(dry_dir / "snapshots")
     snapnote = ""
     if snap is not None:
@@ -140,7 +354,7 @@ def compact_context(cwd: str, ledger: Path) -> str:
     return (
         "[dry] Context was just compacted. The native summary above may have "
         f"dropped specifics.{released_note(dry_dir)} The task ledger below is "
-        f"authoritative{snapnote}. Re-read it before continuing.\n\n---\n{text}\n---"
+        f"authoritative{snapnote}{digestnote}. Re-read it before continuing.\n\n---\n{text}\n---"
     )
 
 
@@ -194,7 +408,7 @@ def main() -> None:
     source = data.get("source")
     ledger = project_dry_dir(data["cwd"]) / "ledger.md"
     if source == "compact":
-        text = compact_context(data["cwd"], ledger)
+        text = compact_context(data["cwd"], ledger, cfg)
         # Whatever was pending is over now (a manual /compact never clears it).
         (project_dry_dir(data["cwd"]) / "compact-pending").unlink(missing_ok=True)
     elif source in ("clear", "resume"):
