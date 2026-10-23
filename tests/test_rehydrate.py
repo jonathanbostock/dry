@@ -194,6 +194,26 @@ def test_digest_cap_configurable(tmp_path):
     assert len(inner) <= 900 and "entry 99 " in inner
 
 
+def test_ledger_over_read_bound_keeps_title_goal_and_newest_tail(tmp_path):
+    proj = make_project(tmp_path)
+    filler = "\n".join(f"- 2026-04-04T00:00Z middle entry {i} " + "m" * 400 for i in range(1200))  # ~500 KB
+    write_ledger(proj, "# Big ledger\n\n## Goal\nStay afloat\n\n## Log\n" + filler + "\n- 2026-05-05T00:00Z NEWEST-AT-THE-END entry\n")
+    inner = _inner(context_of(run_hook(tmp_path, payload(proj, "compact"))))
+    assert inner.startswith("# Big ledger\n## Goal\nStay afloat\n")
+    assert "NEWEST-AT-THE-END" in inner
+    assert inner.index("NEWEST-AT-THE-END") < inner.index("middle entry 1199")
+    assert len(inner) <= 6000
+
+
+def test_ledger_under_read_bound_is_read_whole(tmp_path):
+    proj = make_project(tmp_path)
+    body = "\n".join(f"- 2026-04-04T00:00Z entry {i} " + "k" * 400 for i in range(400))  # ~170 KB, under 256 KB
+    write_ledger(proj, "## Log\n" + body + "\n- LAST-LINE-OF-A-170KB-LEDGER\n")
+    inner = _inner(context_of(run_hook(tmp_path, payload(proj, "compact"))))
+    assert inner.index("LAST-LINE-OF-A-170KB-LEDGER") < inner.index("entry 399 ")
+    assert "ledger middle skipped" not in inner
+
+
 def test_parse_ledger_items_fences_and_continuations():
     sys.path.insert(0, str(SCRIPT.parent))
     import dry_rehydrate as r
