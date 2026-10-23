@@ -49,7 +49,9 @@ try:
 except Exception:  # import failure must never break the session
     sys.exit(0)
 
-LEDGER_READ_MAX = 64 * 1024
+LEDGER_READ_MAX = 256 * 1024   # bound on what is read from disk, not on what is injected
+LEDGER_HEAD_KEEP = 32 * 1024   # of a larger file: this much of the head (title, Goal, Now) + the tail
+MIDDLE_SKIPPED = "\n\n[dry: ledger middle skipped — file larger than 256 KB]\n\n"
 LEDGER_CAP = 6_000
 GOAL_CAP = 150
 TRUNCATION_MARKER = "\n[dry: ledger truncated — Read .claude/dry/ledger.md for the rest]"
@@ -107,9 +109,23 @@ def rel_to(path: Path, cwd: str) -> str:
 
 
 def read_head(path: Path) -> str:
-    """Bounded read: the caps come later, but never load a planted-huge file whole."""
-    with open(path, encoding="utf-8", errors="replace") as f:
-        return f.read(LEDGER_READ_MAX)
+    """Bounded read: the caps come later, but never load a planted-huge file whole.
+
+    The digest wants the newest entries, which an append-only ledger keeps at
+    the END, so a file over the bound is read as its first LEDGER_HEAD_KEEP
+    bytes (title, Goal, Now) plus its last bytes up to the bound, with a marker
+    where the middle was skipped.
+    """
+    size = path.stat().st_size
+    with open(path, "rb") as f:
+        if size <= LEDGER_READ_MAX:
+            raw = f.read(LEDGER_READ_MAX)
+            return raw.decode("utf-8", errors="replace")
+        head = f.read(LEDGER_HEAD_KEEP)
+        f.seek(size - (LEDGER_READ_MAX - LEDGER_HEAD_KEEP))
+        tail = f.read()
+    tail = tail.split(b"\n", 1)[-1]  # drop the partial line the seek landed in
+    return head.decode("utf-8", errors="replace") + MIDDLE_SKIPPED + tail.decode("utf-8", errors="replace")
 
 
 def prune_bookkeeping(text: str) -> str:
