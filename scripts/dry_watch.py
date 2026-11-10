@@ -151,6 +151,40 @@ PENDING_NOTICE = (
     " window limit.)"
 )
 
+SPIRAL_NOTICE = (
+    "[dry] COMPACTION SPIRAL: an auto-compact is pending, but do NOT release it."
+    " After the last compaction this context was already ~{base:,} tokens, i.e."
+    " {pct}% of the ~{pre:,} at which the harness compacts, so each compaction"
+    " buys only ~{room:,} tokens and the loop repeats (fixed overhead + summary"
+    " + re-attached files exceed the budget). Releasing again only spins it."
+    " Do instead, now: (1) bring {ledger} current with everything in flight"
+    " (run dirs, PIDs, next steps, open questions); (2) stop opening new work;"
+    " (3) tell the user in one plain line that this session cannot continue and"
+    " must be restarted with /clear (dry rehydrates from the ledger), and why."
+    " The failsafe still compacts by itself if the context grows {overrun:,}"
+    " tokens past the threshold."
+)
+
+SPIRAL_REMINDER = (
+    "[dry] Reminder: compaction spiral, pending ~{mins} min. Do not release the"
+    " gate; bring {ledger} current and ask the user for /clear in one line."
+)
+
+HANDOFF_COMPACTIONS = (
+    "[dry] This session has compacted {n} times. Each native summary is a summary"
+    " of the last one, and every resume re-reads the whole transcript"
+    " ({mb} MB). At your next clean boundary: bring {ledger} current, then"
+    " recommend to the user in one line a fresh session (/clear) — dry"
+    " rehydrates from the ledger, so nothing is lost. Nothing else changes."
+)
+
+HANDOFF_TRANSCRIPT = (
+    "[dry] This session's transcript is {mb} MB ({n} compactions so far)."
+    " Snapshots and resumes get slow and the native summaries degrade. At your"
+    " next clean boundary: bring {ledger} current, then recommend to the user in"
+    " one line a fresh session (/clear) — dry rehydrates from the ledger."
+)
+
 PENDING_REMINDER = (
     "[dry] Reminder: a gated auto-compact has been pending for ~{mins} min."
     " It keeps waiting for you. Whenever you reach a clean boundary, bring"
@@ -158,9 +192,27 @@ PENDING_REMINDER = (
 )
 
 
-def pending_notice(cwd: str, watch: dict, cfg: dict) -> str | None:
+def spiral_fields(transcript_path: str, cfg: dict) -> dict | None:
+    """Format fields for the spiral notice, or None when the session is healthy."""
+    epochs = _common.compaction_epochs(transcript_path)
+    e = _common.spiral_epoch(epochs, cfg.get("gate_spiral_fraction"))
+    if e is None:
+        return None
+    overrun = cfg.get("gate_max_overrun_tokens")
+    return {
+        "base": e["baseline"],
+        "pre": e["pre"],
+        "pct": round(100 * e["baseline"] / e["pre"]),
+        "room": max(0, e["pre"] - e["baseline"]),
+        "overrun": int(overrun) if isinstance(overrun, (int, float)) else 0,
+    }
+
+
+def pending_notice(cwd: str, watch: dict, cfg: dict, transcript_path: str = "") -> str | None:
     """One notice per gate episode (keyed on the pending marker's mtime),
-    then a reminder every gate_remind_minutes while it stays pending."""
+    then a reminder every gate_remind_minutes while it stays pending. In a
+    compaction spiral (see _common.spiral_epoch) the notice tells the agent
+    NOT to release: another compaction would land at the same baseline."""
     dry_dir = _common.project_dry_dir(cwd)
     marker = dry_dir / "compact-pending"
     try:
@@ -171,9 +223,12 @@ def pending_notice(cwd: str, watch: dict, cfg: dict) -> str | None:
         return None
     now = _common.wall()
     paths = {"ledger": str(dry_dir / "ledger.md"), "flag": str(dry_dir / "compact-ok")}
+    spiral = spiral_fields(transcript_path, cfg) if transcript_path else None
     if watch.get("pending_seen") != mtime:
         watch["pending_seen"] = mtime
         watch["pending_reminded"] = now
+        if spiral:
+            return _common.cap_text(SPIRAL_NOTICE.format(**paths, **spiral), ADVISORY_MAX)
         return _common.cap_text(PENDING_NOTICE.format(**paths), ADVISORY_MAX)
     remind = cfg.get("gate_remind_minutes")
     last = watch.get("pending_reminded")
@@ -183,7 +238,36 @@ def pending_notice(cwd: str, watch: dict, cfg: dict) -> str | None:
     if isinstance(remind, (int, float)) and remind > 0 and now - last >= remind * 60:
         watch["pending_reminded"] = now
         mins = max(1, round((now - mtime) / 60))
-        return _common.cap_text(PENDING_REMINDER.format(mins=mins, **paths), ADVISORY_MAX)
+        template = SPIRAL_REMINDER if spiral else PENDING_REMINDER
+        return _common.cap_text(template.format(mins=mins, **paths), ADVISORY_MAX)
+    return None
+
+
+def handoff_advisory(data: dict, cfg: dict, state: dict, watch: dict) -> str | None:
+    """Once per threshold: a session that has compacted handoff_compactions
+    times or whose transcript exceeds handoff_transcript_mb should be handed
+    off to a fresh session via the ledger rather than compacted again."""
+    n = state.get("compactions")
+    n = n if isinstance(n, int) else 0
+    try:
+        mb = round(os.path.getsize(data["transcript_path"]) / 1_000_000)
+    except (OSError, KeyError, TypeError):
+        mb = 0
+    ledger = str(_common.project_dry_dir(data["cwd"]) / "ledger.md")
+    limit_n = cfg.get("handoff_compactions")
+    limit_mb = cfg.get("handoff_transcript_mb")
+    if (
+        isinstance(limit_n, (int, float)) and limit_n > 0 and n >= limit_n
+        and not watch.get("handoff_warned_compactions")
+    ):
+        watch["handoff_warned_compactions"] = True
+        return _common.cap_text(HANDOFF_COMPACTIONS.format(n=n, mb=mb, ledger=ledger), ADVISORY_MAX)
+    if (
+        isinstance(limit_mb, (int, float)) and limit_mb > 0 and mb >= limit_mb
+        and not watch.get("handoff_warned_transcript")
+    ):
+        watch["handoff_warned_transcript"] = True
+        return _common.cap_text(HANDOFF_TRANSCRIPT.format(n=n, mb=mb, ledger=ledger), ADVISORY_MAX)
     return None
 
 
@@ -227,7 +311,7 @@ def main() -> None:
     watch = watch_state(state)
     # The gate's pending marker outranks throttling: the agent must learn
     # promptly that a deferred compaction is waiting on it.
-    notice = pending_notice(data["cwd"], watch, cfg)
+    notice = pending_notice(data["cwd"], watch, cfg, str(data.get("transcript_path") or ""))
 
     text = None
     if event == "PostToolUse":
@@ -245,8 +329,11 @@ def main() -> None:
     else:
         text = full_check(data, cfg, watch)
 
+    handoff = None
+    if text is not None or event == "UserPromptSubmit":
+        handoff = handoff_advisory(data, cfg, state, watch)
     _common.save_state(session_id, state)
-    combined = "\n\n".join(t for t in (notice, text) if t)
+    combined = "\n\n".join(t for t in (notice, text, handoff) if t)
     if combined:
         _common.emit({
             "hookSpecificOutput": {

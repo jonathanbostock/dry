@@ -24,6 +24,7 @@ The dry status report, captured at invocation time:
 **mode: gated self-compaction** — the reset is yours to perform; do not ask the user.
 
 - If `gate:` shows an auto-compact pending: this command *is* your boundary, so release it now with the `touch` command printed on that line, and say in one line that the ledger is checkpointed and compaction proceeds on the next attempt. Then continue with the next ledger item.
+- If the report or a `[dry]` notice says **compaction spiral** (the post-compaction context is already most of the compaction threshold): do NOT release the gate — another compaction lands at the same baseline. Say in one plain line that the ledger is checkpointed and that this session must be restarted with `/clear` (dry rehydrates from the ledger), and why.
 - If nothing is pending: say in one line that the ledger is checkpointed, and carry on. Compaction becomes available when the harness next attempts one; dry will tell you.
 
 **mode: interactive** — end your reply with a clearly marked recommendation block containing exactly one of:

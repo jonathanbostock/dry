@@ -188,3 +188,15 @@ Two live smokes run real headless sessions in a sandbox project, wiring the hook
 - PreCompact on a *manual* `/compact` is unit-tested but not live-observed (the forced live compaction was an auto trigger; `-p` mode can't type `/compact`). The auto path — the one that matters for unattended long tasks — is live-verified end to end.
 - Two accepted small races, both self-correcting within a turn: parallel tool calls can double-emit one band advisory (state is last-writer-wins), and between a compaction and the next assistant turn the token reading is "unknown" rather than a number.
 - Per-call overhead measured on this box: ~70 ms for a throttled watch call, ~140 ms for watch+guard on a matched call (Python startup dominates). If that ever matters, narrow the PostToolUse matchers.
+
+
+## Compaction spirals and session handoff (0.4.0)
+
+A session whose *post-compaction* context is already most of the size the harness compacts at cannot be rescued by compacting again: fixed overhead (system prompt, tools, skills, CLAUDE.md, memory) plus the native summary and re-attached files leave a few thousand tokens of room, so the loop repeats every few minutes and the native summaries degrade into summaries of summaries. One session on this box did that 582 times before anyone noticed.
+
+dry 0.4.0 detects it from the transcript (`compactMetadata.preTokens` of the last boundary vs. the first assistant usage after it; `gate_spiral_fraction`, default 0.75) and changes what it tells the agent: the pending notice and the post-compaction rehydration say **do not release the gate; bring the ledger current and ask the user for `/clear`**. Two further guards:
+
+- **Overrun failsafe** (`gate_max_overrun_tokens`, default 20k): the gate records the context size at the first blocked attempt of an episode and lets the next attempt through once the context has grown that much past it, whatever the window table says. The window table itself now defaults to 200k (1M only for `[1m]` model ids; `window_tokens` overrides) — assuming 1M for any non-haiku model let a Fable 5.2 session run into the API's "Prompt is too long" instead of compacting.
+- **Handoff advisories** (`handoff_compactions`, default 40; `handoff_transcript_mb`, default 250): once per threshold, dry suggests moving to a fresh session via the ledger.
+
+Snapshots are bounded too: a transcript over `snapshot_max_bytes` (default 64 MB) is snapshotted as its tail (`-tail.jsonl.gz`), stale `.tmp` debris from timed-out snapshots is removed, and `snapshots_max_total_mb` (default 2048) caps the directory.

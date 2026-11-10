@@ -39,10 +39,12 @@ try:
         fail_open,
         gate_enabled,
         load_config,
+        load_state,
         log_debug,
         now_stamp,
         project_dry_dir,
         read_stdin_json,
+        save_state,
     )
 except Exception:  # import failure must never break the session
     sys.exit(0)
@@ -74,18 +76,73 @@ def prune(snapdir: Path, pattern: str, keep: int) -> None:
             log_debug(f"prune: could not unlink {path}")
 
 
-def snapshot_transcript(transcript_path: str, dest: Path) -> bool:
-    """Stream-gzip the transcript to dest (never load it whole)."""
+STALE_TMP_SECONDS = 15 * 60
+
+
+def snapshot_transcript(transcript_path: str, dest: Path, max_bytes: int = 0) -> Path | None:
+    """Stream-gzip the transcript to dest (never load it whole).
+
+    A transcript larger than max_bytes (> 0) is snapshotted as its last
+    max_bytes from a line boundary, under a `-tail` name: gzipping a
+    multi-hundred-MB file on every compaction overran the hook timeout,
+    left .tmp debris and filled the disk, and the recovery value lives in
+    the recent part anyway (the harness keeps the full transcript).
+    Returns the written path, or None.
+    """
+    try:
+        size = os.path.getsize(transcript_path)
+    except OSError:
+        return None
+    start = 0
+    if isinstance(max_bytes, int) and 0 < max_bytes < size:
+        start = size - max_bytes
+        dest = dest.with_name(dest.name.replace(".jsonl.gz", "-tail.jsonl.gz"))
     tmp = dest.with_name(dest.name + f".tmp{os.getpid()}")
     try:
         with open(transcript_path, "rb") as src, gzip.open(tmp, "wb") as dst:
+            if start:
+                src.seek(start)
+                src.readline()  # drop the partial line the seek landed in
             shutil.copyfileobj(src, dst)
         os.replace(tmp, dest)
-        return True
-    except OSError:
+        return dest
+    except BaseException:
         log_debug(f"snapshot of {transcript_path} failed")
         tmp.unlink(missing_ok=True)
-        return False
+        return None
+
+
+def remove_stale_tmp(snapdir: Path) -> None:
+    """Debris from snapshots killed mid-write (hook timeout) is never completed."""
+    now = time.time()
+    for path in snapdir.glob("*.tmp*"):
+        try:
+            if now - path.stat().st_mtime > STALE_TMP_SECONDS:
+                path.unlink()
+        except OSError:
+            pass
+
+
+def prune_total(snapdir: Path, pattern: str, max_total_mb: int | float) -> None:
+    """Unlink the oldest matches until the total is under max_total_mb, always
+    keeping the newest one."""
+    if not isinstance(max_total_mb, (int, float)) or max_total_mb <= 0:
+        return
+    files = sorted(p for p in snapdir.glob(pattern) if p.is_file())
+    try:
+        total = sum(p.stat().st_size for p in files)
+    except OSError:
+        return
+    limit = max_total_mb * 1024 * 1024
+    for path in files[:-1]:
+        if total <= limit:
+            break
+        try:
+            size = path.stat().st_size
+            path.unlink()
+            total -= size
+        except OSError:
+            pass
 
 
 RELEASED_MARKER_MAX_AGE_SECONDS = 120  # PreCompact -> PostCompact is seconds apart
@@ -98,7 +155,7 @@ def append_ledger_line(dry_dir: Path, entry: str) -> None:
         f.write(header + "\n" + entry + "\n")
 
 
-RELEASE_KINDS = ("flag", "failsafe", "timeout", "blind")
+RELEASE_KINDS = ("flag", "failsafe", "overrun", "timeout", "blind")
 
 
 def consume_released_marker(dry_dir: Path) -> tuple[str, str] | None:
@@ -139,6 +196,9 @@ def ledger_note_after_auto_compact(dry_dir: Path, cwd: str) -> None:
         entry = f"- ✓ {stamp}: compaction released at a boundary (gated run){tail}"
     elif kind == "failsafe":
         entry = f"- ⚠ {stamp}: auto-compact forced by the gate's failsafe (never released){tail}"
+    elif kind == "overrun":
+        by = f" {detail} tokens" if detail else ""
+        entry = f"- ⚠ {stamp}: auto-compact forced by the gate's overrun failsafe (context grew{by} past the harness threshold without release){tail}"
     elif kind == "timeout":
         mins = f" {detail} min" if detail else ""
         entry = f"- ⚠ {stamp}: compaction taken automatically after the gate had been pending{mins} without release{tail}"
@@ -159,6 +219,7 @@ def handle_pre_compact(data: dict, cfg: dict) -> None:
         return
     snapdir = dry_dir / "snapshots"
     snapdir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    remove_stale_tmp(snapdir)
     # Gated runs retry PreCompact every ~80 s while blocked; don't re-gzip a
     # large transcript on each attempt (the ledger, not the snapshot, is the
     # recovery anchor — a snapshot up to 10 min old is plenty).
@@ -170,9 +231,10 @@ def handle_pre_compact(data: dict, cfg: dict) -> None:
     if time.time() - newest < interval:
         return
     dest = snapdir / f"{now_stamp()}-{sid8(data.get('session_id'))}-{safe_name(trigger)}.jsonl.gz"
-    if not snapshot_transcript(transcript_path, dest):
+    if snapshot_transcript(transcript_path, dest, cfg["snapshot_max_bytes"]) is None:
         return
     prune(snapdir, "*.jsonl.gz", cfg["snapshots_keep"])
+    prune_total(snapdir, "*.jsonl.gz", cfg["snapshots_max_total_mb"])
 
 
 def handle_post_compact(data: dict, cfg: dict) -> None:
@@ -187,6 +249,12 @@ def handle_post_compact(data: dict, cfg: dict) -> None:
         prune(snapdir, "*.md", cfg["snapshots_keep"])
     if trigger == "auto":
         ledger_note_after_auto_compact(dry_dir, cwd)
+    session_id = str(data.get("session_id") or "")
+    if session_id:
+        state = load_state(session_id)
+        count = state.get("compactions")
+        state["compactions"] = (count if isinstance(count, int) else 0) + 1
+        save_state(session_id, state)
 
 
 def main() -> None:
