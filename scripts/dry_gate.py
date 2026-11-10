@@ -23,9 +23,13 @@ Protocol:
     compact-released ("flag" | "failsafe") so dry_checkpoint's PostCompact
     ledger note can say whether the compaction was the agent's own boundary
     release or a forced one.
-  - Failsafe: near the model's real window the gate always allows — blocking
-    an error-recovery compaction would fail the request outright. A blind
-    gate (transcript unreadable) also allows. And once an attempt has been
+  - Failsafe: near the model's real window (default 200k; `[1m]` models 1M;
+    config window_tokens overrides) the gate always allows — blocking an
+    error-recovery compaction would fail the request outright. A second,
+    model-agnostic failsafe allows once the context has grown
+    gate_max_overrun_tokens (default 20k) past the size at which the
+    harness first attempted this episode. A blind gate (transcript
+    unreadable) also allows. And once an attempt has been
     pending for gate_max_pending_minutes (default 90) the gate lets the next
     one through: a lost notice must never strand a run until the failsafe.
   - A manual /compact clears any pending episode, so the next auto attempt
@@ -54,13 +58,11 @@ try:
         log_debug,
         project_dry_dir,
         read_stdin_json,
+        real_window,
         transcript_context_tokens,
     )
 except Exception:  # import failure must never strand the session
     sys.exit(0)
-
-WINDOW_1M = 1_000_000
-WINDOW_200K = 200_000
 
 BLOCK_STDERR = "dry gate: deferring auto-compact until a boundary (release: touch {flag})"
 
@@ -68,14 +70,15 @@ BLOCK_STDERR = "dry gate: deferring auto-compact until a boundary (release: touc
 STALE_PENDING_MINUTES = 24 * 60
 
 
-def real_window(info: dict) -> int:
-    model = (info.get("model") or "").lower()
-    small = (
-        not model
-        or "haiku" in model
-        or os.environ.get("CLAUDE_CODE_DISABLE_1M_CONTEXT") == "1"
-    )
-    return WINDOW_200K if small else WINDOW_1M
+def attempt_tokens(pending: Path) -> int | None:
+    """Context size recorded when this pending episode's first attempt was blocked."""
+    try:
+        for line in pending.read_text(encoding="utf-8").splitlines():
+            if line.startswith("attempt_tokens="):
+                return int(line.split("=", 1)[1].strip())
+    except (OSError, ValueError):
+        pass
+    return None
 
 
 def marker_paths(dry_dir: Path, cwd: str, name: str) -> list[Path]:
@@ -147,8 +150,22 @@ def main() -> None:
     if info is None:
         allow(dry_dir, cwd, "blind")  # can't see context size -> never block blind
         return
-    if info["tokens"] >= cfg["gate_failsafe_fraction"] * real_window(info):
+    if info["tokens"] >= cfg["gate_failsafe_fraction"] * real_window(info.get("model"), cfg):
         allow(dry_dir, cwd, "failsafe")
+        return
+    # Overrun failsafe: the harness attempted at its own threshold; once the
+    # context has grown gate_max_overrun_tokens past that first attempt the
+    # agent has had its chance, and waiting further risks the API rejecting
+    # the prompt outright (seen on a model whose window the table overestimated).
+    first = attempt_tokens(pending)
+    overrun = cfg["gate_max_overrun_tokens"]
+    if (
+        first is not None
+        and isinstance(overrun, (int, float))
+        and overrun > 0
+        and info["tokens"] >= first + overrun
+    ):
+        allow(dry_dir, cwd, "overrun", str(int(info["tokens"] - first)))
         return
 
     try:
@@ -171,7 +188,10 @@ def main() -> None:
     # Block. Create the pending marker only if absent — its mtime is the
     # dedupe key dry_watch uses, so re-blocks must not refresh it.
     if not pending.exists():
-        atomic_write(pending, "a dry_gate-deferred auto-compact is pending\n")
+        atomic_write(
+            pending,
+            f"a dry_gate-deferred auto-compact is pending\nattempt_tokens={int(info['tokens'])}\n",
+        )
     print(BLOCK_STDERR.format(flag=dry_dir / "compact-ok"), file=sys.stderr)
     sys.exit(2)
 

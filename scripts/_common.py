@@ -50,6 +50,13 @@ DEFAULTS = {
     "gate_remind_minutes": 30,
     "gate_max_pending_minutes": 90,
     "gate_snapshot_min_interval_seconds": 600,
+    "gate_max_overrun_tokens": 20_000,
+    "gate_spiral_fraction": 0.75,
+    "window_tokens": 0,
+    "snapshot_max_bytes": 64 * 1024 * 1024,
+    "snapshots_max_total_mb": 2048,
+    "handoff_compactions": 40,
+    "handoff_transcript_mb": 250,
     "disable": False,
     "disable_watch": False,
     "disable_guard": False,
@@ -278,6 +285,110 @@ def transcript_context_tokens(path: str) -> dict | None:
             continue
         model = msg.get("model") if isinstance(msg.get("model"), str) else None
         return {"tokens": tokens, "model": model}
+    return None
+
+
+COMPACT_TAIL_BYTES = 8 * 1024 * 1024
+WINDOW_1M = 1_000_000
+WINDOW_200K = 200_000
+
+
+def real_window(model: str | None, cfg: dict | None = None) -> int:
+    """The model's real context window, for failsafes.
+
+    Default 200k: every current Claude model is 200k unless its id carries the
+    1M marker ("[1m]"), and guessing too large is the dangerous direction (the
+    gate deferred compaction until the API rejected the prompt when this
+    assumed 1M for any non-haiku model). Config `window_tokens` > 0 overrides.
+    """
+    if cfg:
+        w = cfg.get("window_tokens")
+        if isinstance(w, int) and not isinstance(w, bool) and w > 0:
+            return w
+    if os.environ.get("CLAUDE_CODE_DISABLE_1M_CONTEXT") == "1":
+        return WINDOW_200K
+    m = (model or "").lower()
+    if "[1m]" in m or m.endswith("-1m"):
+        return WINDOW_1M
+    return WINDOW_200K
+
+
+def _usage_total(rec: dict) -> int | None:
+    if rec.get("type") != "assistant" or rec.get("isSidechain"):
+        return None
+    msg = rec.get("message")
+    if not isinstance(msg, dict):
+        return None
+    usage = msg.get("usage")
+    if not isinstance(usage, dict) or "input_tokens" not in usage:
+        return None
+    total = 0
+    for key in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "output_tokens"):
+        v = usage.get(key)
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            total += int(v)
+    return total if total > 0 else None
+
+
+def compaction_epochs(path: str, tail_bytes: int = COMPACT_TAIL_BYTES) -> list[dict]:
+    """Compaction epochs visible in the transcript tail, oldest first.
+
+    Each is {"pre": preTokens, "post": postTokens, "baseline": tokens of the
+    first main-chain assistant call after the boundary, or None}. Only the
+    tail is read: an epoch that has produced more than `tail_bytes` of
+    transcript is not a spiral, which is all callers ask.
+    """
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            offset = max(0, size - tail_bytes)
+            f.seek(offset)
+            chunk = f.read()
+    except OSError:
+        return []
+    lines = chunk.split(b"\n")
+    if offset > 0 and len(lines) > 1:
+        lines = lines[1:]
+    epochs: list[dict] = []
+    for raw in lines:
+        raw = raw.strip()
+        if not raw or b"usage" not in raw and b"compact_boundary" not in raw:
+            continue
+        try:
+            rec = json.loads(raw)
+        except Exception:
+            continue
+        if not isinstance(rec, dict):
+            continue
+        if rec.get("type") == "system" and rec.get("subtype") == "compact_boundary":
+            meta = rec.get("compactMetadata")
+            meta = meta if isinstance(meta, dict) else {}
+            pre = meta.get("preTokens")
+            post = meta.get("postTokens")
+            epochs.append({
+                "pre": int(pre) if isinstance(pre, (int, float)) and not isinstance(pre, bool) else None,
+                "post": int(post) if isinstance(post, (int, float)) and not isinstance(post, bool) else None,
+                "baseline": None,
+            })
+            continue
+        if epochs and epochs[-1]["baseline"] is None:
+            total = _usage_total(rec)
+            if total:
+                epochs[-1]["baseline"] = total
+    return epochs
+
+
+def spiral_epoch(epochs: list[dict], fraction: float) -> dict | None:
+    """The newest epoch whose post-compaction baseline is already at least
+    `fraction` of the size the harness compacts at — i.e. compaction bought
+    almost nothing and will again. None when the newest measurable epoch is
+    healthy or nothing is measurable."""
+    if not isinstance(fraction, (int, float)) or fraction <= 0:
+        return None
+    for e in reversed(epochs):
+        if e["baseline"] is not None and e["pre"]:
+            return e if e["baseline"] >= fraction * e["pre"] else None
     return None
 
 

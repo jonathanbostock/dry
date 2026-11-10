@@ -40,7 +40,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
     from _common import (
         cap_text,
+        compaction_epochs,
         emit,
+        spiral_epoch,
         fail_open,
         load_config,
         project_dry_dir,
@@ -80,12 +82,26 @@ RESET_NOTES = {
     "failsafe": ("This compaction was forced by the gate's failsafe near the model's"
                  " window limit — the gate was never released, so treat the reset as"
                  " ungraceful: anything mid-flight may be missing from the ledger."),
+    "overrun": ("This compaction was forced by the gate's overrun failsafe: the context"
+                " grew {detail} tokens past the harness threshold without a release,"
+                " so treat the reset as ungraceful: anything mid-flight may be missing"
+                " from the ledger."),
     "timeout": ("This compaction was taken automatically after the gate had been"
                 " pending {detail} without release — treat the reset as ungraceful:"
                 " anything mid-flight may be missing from the ledger."),
     "blind": ("dry could not read the context size and let this auto-compact"
               " through; it was not at a boundary you chose."),
 }
+
+SPIRAL_WARNING = (
+    "\n\n[dry] WARNING — COMPACTION SPIRAL. After the previous compaction this"
+    " context was already ~{base:,} tokens ({pct}% of the ~{pre:,} at which the"
+    " harness compacts): fixed overhead + summary + re-attached files leave"
+    " almost no room, so compaction cannot recover this session. Do not release"
+    " the gate again. Do now: bring the ledger current with everything in flight,"
+    " open no new work, and tell the user in one plain line that this session"
+    " must be restarted with /clear (dry rehydrates from the ledger) and why."
+)
 
 NO_LEDGER_MSG = (
     "[dry] Context was just compacted and no task ledger exists at "
@@ -425,6 +441,12 @@ def main() -> None:
     ledger = project_dry_dir(data["cwd"]) / "ledger.md"
     if source == "compact":
         text = compact_context(data["cwd"], ledger, cfg)
+        epochs = compaction_epochs(str(data.get("transcript_path") or ""))
+        e = spiral_epoch(epochs, cfg.get("gate_spiral_fraction"))
+        if e is not None and text:
+            text += SPIRAL_WARNING.format(
+                base=e["baseline"], pre=e["pre"], pct=round(100 * e["baseline"] / e["pre"])
+            )
         # Whatever was pending is over now (a manual /compact never clears it).
         (project_dry_dir(data["cwd"]) / "compact-pending").unlink(missing_ok=True)
     elif source in ("clear", "resume"):
